@@ -157,7 +157,25 @@ function getPaymentAmount(payment, keys) {
 
   return 0;
 }
+function normalizeSalesData(sales) {
+  if (Array.isArray(sales)) {
+    return sales;
+  }
 
+  if (
+    sales &&
+    typeof sales === "object" &&
+    !Array.isArray(sales)
+  ) {
+    return Object.values(sales).flatMap((daySales) => {
+      return Array.isArray(daySales)
+        ? daySales
+        : [];
+    });
+  }
+
+  return [];
+}
 /**
  * Добавляет сумму продажи в разбивку по способам оплаты.
  *
@@ -182,59 +200,89 @@ function addPaymentToSummary(
 ) {
   const payment = getPaymentObject(item);
 
-  const cash = getPaymentAmount(payment, [
+  /*
+  |--------------------------------------------------------------------------
+  | В sales.json платежи хранятся в копейках:
+  |
+  | cash: 5000       -> 50 сом
+  | card: 25000      -> 250 сом
+  | online_qr: 5000  -> 50 сом
+  |
+  | Поэтому здесь переводим копейки в сомы.
+  |--------------------------------------------------------------------------
+  */
+
+  const cashKopecks = getPaymentAmount(payment, [
     "cash",
   ]);
 
-  const card = getPaymentAmount(payment, [
+  const cardKopecks = getPaymentAmount(payment, [
     "card",
   ]);
 
-  const amanat = getPaymentAmount(payment, [
+  const amanatKopecks = getPaymentAmount(payment, [
     "amanat",
     "credit",
   ]);
 
-  const mplus = getPaymentAmount(payment, [
+  const mplusKopecks = getPaymentAmount(payment, [
     "mplus",
     "delivery",
   ]);
 
-  const local = getPaymentAmount(payment, [
+  const localKopecks = getPaymentAmount(payment, [
     "local",
     "localPayment",
   ]);
 
-  const knownPaymentTotal =
-    cash +
-    card +
-    amanat +
-    mplus +
-    local;
+  const onlineQrKopecks = getPaymentAmount(payment, [
+    "online_qr",
+    "onlineQr",
+    "onlineQR",
+  ]);
+
+  const hasPaymentFields =
+    cashKopecks > 0 ||
+    cardKopecks > 0 ||
+    amanatKopecks > 0 ||
+    mplusKopecks > 0 ||
+    localKopecks > 0 ||
+    onlineQrKopecks > 0;
 
   /*
   |--------------------------------------------------------------------------
-  | Смешанная оплата
+  | Если есть реальные payment-поля
   |--------------------------------------------------------------------------
-  |
-  | Если есть отдельные суммы cash/card/amanat/mplus/local,
-  | распределяем их по соответствующим категориям.
-  |
   */
 
-  if (knownPaymentTotal > 0) {
+  if (hasPaymentFields) {
+    const cash = cashKopecks / 100;
+    const card = cardKopecks / 100;
+    const amanat = amanatKopecks / 100;
+    const mplus = mplusKopecks / 100;
+    const local = localKopecks / 100;
+    const onlineQr = onlineQrKopecks / 100;
+
     salesByPayment.cash += cash;
     salesByPayment.card += card;
     salesByPayment.amanat += amanat;
     salesByPayment.mplus += mplus;
     salesByPayment.local += local;
+    salesByPayment.online_qr += onlineQr;
 
-    return knownPaymentTotal;
+    return (
+      cash +
+      card +
+      amanat +
+      mplus +
+      local +
+      onlineQr
+    );
   }
 
   /*
   |--------------------------------------------------------------------------
-  | Обычный способ оплаты одной строкой
+  | Обычная продажа, где payment содержит только method
   |--------------------------------------------------------------------------
   */
 
@@ -246,9 +294,17 @@ function addPaymentToSummary(
     item?.paymentMethod ||
     item?.paymentType;
 
+  /*
+  |--------------------------------------------------------------------------
+  | fallbackAmount уже находится в сомах,
+  | потому что сюда передаётся sale.totalSom / sale.total
+  |--------------------------------------------------------------------------
+  */
+
   const amount = Math.abs(
     toNumber(
       fallbackAmount ||
+        item?.totalSom ||
         item?.total ||
         item?.sum ||
         item?.amount
@@ -288,24 +344,27 @@ function addPaymentToSummary(
       salesByPayment.local += amount;
       break;
 
+    case "online_qr":
+    case "onlineqr":
+    case "online-qr":
+    case "online qr":
+    case "онлайн qr":
+    case "онлайн-qr":
+    case "онлайн":
+    case "qr":
+      salesByPayment.online_qr += amount;
+      break;
+
     case "cash":
     case "наличные":
     case "":
     default:
-      /*
-      |--------------------------------------------------------------------------
-      | Если способ оплаты не указан,
-      | относим сумму к наличным.
-      |--------------------------------------------------------------------------
-      */
-
       salesByPayment.cash += amount;
       break;
   }
 
   return amount;
 }
-
 /*
 |--------------------------------------------------------------------------
 | ROUTE: REPORTS
@@ -512,11 +571,7 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const salesArray = Array.isArray(
-      sales
-    )
-      ? sales
-      : [];
+ const salesArray = normalizeSalesData(sales);
 
     const filteredSales = salesArray.filter(
       (sale) => {
@@ -549,6 +604,7 @@ router.get("/", async (req, res) => {
       amanat: 0,
       mplus: 0,
       local: 0,
+       online_qr: 0,
     };
 
     /*
@@ -561,13 +617,14 @@ router.get("/", async (req, res) => {
       salesCount = filteredSales.length;
 
       filteredSales.forEach((sale) => {
-        const total = Math.abs(
-          toNumber(
-            sale.total ??
-              sale.sum ??
-              sale.amount
-          )
-        );
+       const total = Math.abs(
+  toNumber(
+    sale.totalSom ??
+      sale.total ??
+      sale.sum ??
+      sale.amount
+  )
+);
 
         salesTotal += total;
 
@@ -614,13 +671,13 @@ router.get("/", async (req, res) => {
     | используем данные из cash.json
     |--------------------------------------------------------------------------
     */
-
-    const paymentTotalFromSales =
-      salesByPayment.cash +
-      salesByPayment.card +
-      salesByPayment.amanat +
-      salesByPayment.mplus +
-      salesByPayment.local;
+const paymentTotalFromSales =
+  salesByPayment.cash +
+  salesByPayment.card +
+  salesByPayment.amanat +
+  salesByPayment.mplus +
+  salesByPayment.local +
+  salesByPayment.online_qr;
 
     if (
       filteredSales.length > 0 &&
@@ -632,6 +689,7 @@ router.get("/", async (req, res) => {
       salesByPayment.amanat = 0;
       salesByPayment.mplus = 0;
       salesByPayment.local = 0;
+      salesByPayment.online_qr = 0;
 
       cashSaleTransactions.forEach(
         (transaction) => {
@@ -1044,6 +1102,76 @@ router.get("/", async (req, res) => {
       success: false,
       message:
         "Не удалось сформировать отчёт",
+      error: error.message,
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| ROUTE: CLEAR ALL DATA
+|--------------------------------------------------------------------------
+| DELETE /api/reports/clear
+|--------------------------------------------------------------------------
+*/
+
+router.delete("/clear", async (req, res) => {
+  try {
+    const files = [
+      "cash.json",
+      "expenses.json",
+      "sales.json",
+      "reservations.json",
+      "purchases.json",
+      "transfers.json",
+      "returns.json",
+    ];
+
+    const emptyData = {
+      "cash.json": {
+        balance: 0,
+        transactions: [],
+      },
+
+      "expenses.json": [],
+
+      "sales.json": [],
+
+      "reservations.json": [],
+
+      "purchases.json": [],
+
+      "transfers.json": [],
+
+      "returns.json": [],
+    };
+
+    for (const fileName of files) {
+      const filePath = path.join(DATA_DIR, fileName);
+
+      await fs.writeFile(
+        filePath,
+        JSON.stringify(emptyData[fileName], null, 2),
+        "utf8"
+      );
+    }
+
+    console.log("ВСЕ JSON-ДАННЫЕ ОЧИЩЕНЫ");
+
+    res.json({
+      success: true,
+      message: "Все данные успешно очищены",
+      files: files,
+    });
+  } catch (error) {
+    console.error(
+      "CLEAR DATA ERROR:",
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      message: "Не удалось очистить данные",
       error: error.message,
     });
   }

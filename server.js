@@ -9,7 +9,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: "https://runo-o9blc8gwm-aman009006s-projects.vercel.app",
+    origin: "https://runo-rouge.vercel.app",
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -59,6 +59,9 @@ const DATA_DIR = path.join(__dirname, "..", "data");
 const SALES_FILE = path.join(DATA_DIR, "sales.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
 const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
+
+app.use(cors());
+app.use(express.json());
 
 // Создаем папку data
 if (!fs.existsSync(DATA_DIR)) {
@@ -298,13 +301,13 @@ function addReturnToCash(cashSum, orderId, returnId, returnDocumentId) {
     const balanceBefore = cashData.balance;
 
     // Проверяем, хватает ли денег
-    if (balanceBefore < amountSom) {
-      throw new Error(
-        `Недостаточно денег в кассе для возврата. ` +
-          `Баланс: ${balanceBefore} сом, ` +
-          `требуется: ${amountSom} сом`,
-      );
-    }
+    // if (balanceBefore < amountSom) {
+    //   throw new Error(
+    //     `Недостаточно денег в кассе для возврата. ` +
+    //       `Баланс: ${balanceBefore} сом, ` +
+    //       `требуется: ${amountSom} сом`,
+    //   );
+    // }
 
     // Новый баланс
     const balanceAfter = balanceBefore - amountSom;
@@ -412,8 +415,7 @@ app.get("/api/moysklad/sales", (req, res) => {
 
 app.use("/api/reservations", reservationsRouter);
 
-app.use(cors());
-app.use(express.json());
+
 
 let moySkladToken = null;
 let moySkladOrganization = null;
@@ -895,8 +897,11 @@ app.get("/api/moysklad/products", async (req, res) => {
     console.log("Получаем товары склада:", storeId);
 
     const storeHref = `${MOYSKLAD_API}/entity/store/${storeId}`;
-
     const filterParam = encodeURIComponent(`store=${storeHref}`);
+
+    // =====================================================
+    // 1. ОСТАТКИ ОБЫЧНЫХ ТОВАРОВ
+    // =====================================================
 
     const stockData = await moySkladRequest(
       `/report/stock/all?filter=${filterParam}&limit=1000`,
@@ -904,64 +909,183 @@ app.get("/api/moysklad/products", async (req, res) => {
 
     const stockRows = stockData.rows || [];
 
-    console.log(`Получено товаров: ${stockRows.length}`);
+    console.log(`Получено товаров со склада: ${stockRows.length}`);
 
-    const products = stockRows.map((item) => {
-      const rawHref = item.meta?.href || "";
+    // =====================================================
+    // 2. ПОЛУЧАЕМ КОМПЛЕКТЫ
+    // =====================================================
+
+    const bundleData = await moySkladRequest(
+      `/entity/bundle?limit=1000`,
+    );
+
+    const bundles = bundleData.rows || [];
+
+    console.log(`Получено комплектов: ${bundles.length}`);
+
+    // =====================================================
+    // 3. ПРЕОБРАЗУЕМ ОБЫЧНЫЕ ТОВАРЫ
+    // =====================================================
+
+  const products = stockRows.map((item) => {
+  const rawHref = item.meta?.href || "";
+
+  const cleanHref = rawHref.split("?")[0];
+
+  const productId = cleanHref.split("/").pop() || "";
+
+  // Цена продажи
+  const price = item.salePrice
+    ? item.salePrice / 100
+    : 0;
+
+  // Старая себестоимость — оставляем без изменений
+  const buyPrice = item.price
+    ? item.price / 100
+    : 0;
+
+  // Новое отдельное поле себестоимости
+  const costPrice = item.price
+    ? item.price / 100
+    : 0;
+
+  return {
+    id: productId,
+
+    name: item.name || "Товар без названия",
+
+    code: item.code || "",
+
+    article: item.article || "",
+
+    // Цена продажи
+    price,
+
+    // Старая логика — НЕ УДАЛЯЕМ
+    buyPrice,
+
+    // Новое поле себестоимости
+    costPrice,
+
+    stock: Number(item.stock || 0),
+
+    reserve: Number(item.reserve || 0),
+
+    inTransit: Number(item.inTransit || 0),
+
+    reserveStock: Number(item.reserveStock || 0),
+
+    meta: item.meta,
+
+    uom: item.uom?.name || "шт",
+
+    pathName:
+      item.folder?.name ||
+      item.productFolder?.name ||
+      "Общая категория",
+
+    description: item.description || "",
+
+    type: item.meta?.type || "product",
+
+    isBundle: false,
+  };
+});
+
+    // =====================================================
+    // 4. ДОБАВЛЯЕМ КОМПЛЕКТЫ
+    // =====================================================
+
+    const bundleProducts = bundles.map((bundle) => {
+      const rawHref = bundle.meta?.href || "";
 
       const cleanHref = rawHref.split("?")[0];
 
-      const productId = cleanHref.split("/").pop() || "";
+      const bundleId = cleanHref.split("/").pop() || "";
 
-      const price = item.salePrice ? item.salePrice / 100 : 0;
+      // salePrices содержит цены комплекта
+      const price =
+        bundle.salePrices?.[0]?.value != null
+          ? bundle.salePrices[0].value / 100
+          : 0;
 
-      const buyPrice = item.price ? item.price / 100 : 0;
+      const buyPrice =
+        bundle.buyPrice != null
+          ? bundle.buyPrice / 100
+          : 0;
 
       return {
-        id: productId,
+        id: bundleId,
 
-        name: item.name || "Товар без названия",
+        name: bundle.name || "Комплект без названия",
 
-        code: item.code || "",
+        code: bundle.code || "",
 
-        article: item.article || "",
+        article: bundle.article || "",
 
         price,
 
         buyPrice,
 
-        stock: Number(item.stock || 0),
+        // Пока ставим 0.
+        // Остаток комплекта нужно рассчитывать
+        // отдельно из его компонентов.
+        stock: 0,
 
-        reserve: Number(item.reserve || 0),
+        reserve: 0,
 
-        inTransit: Number(item.inTransit || 0),
-        meta: item.meta,
+        inTransit: 0,
 
-        uom: item.uom?.name || "шт",
+        meta: bundle.meta,
+
+        uom: bundle.uom?.name || "шт",
 
         pathName:
-          item.folder?.name || item.productFolder?.name || "Общая категория",
+          bundle.productFolder?.name ||
+          bundle.folder?.name ||
+          "Общая категория",
 
-        description: item.description || "",
+        description: bundle.description || "",
 
-        type: item.meta?.type || "product",
+        type: "bundle",
+
+        isBundle: true,
       };
     });
+
+    // =====================================================
+    // 5. ОБЪЕДИНЯЕМ ТОВАРЫ И КОМПЛЕКТЫ
+    // =====================================================
+
+    const allProducts = [
+      ...products,
+      ...bundleProducts,
+    ];
+
+    console.log(
+      `Итого товаров: ${products.length}, комплектов: ${bundleProducts.length}`,
+    );
 
     return res.json({
       storeId,
 
       storeName: "Молодая Гвардия 41",
 
-      total: products.length,
+      total: allProducts.length,
 
-      rows: products,
+      productsCount: products.length,
+
+      bundlesCount: bundleProducts.length,
+
+      rows: allProducts,
     });
   } catch (error) {
     console.error("Ошибка получения товаров:", error);
 
     return res.status(500).json({
-      message: error.message || "Ошибка получения товаров МойСклад",
+      message:
+        error.message ||
+        "Ошибка получения товаров МойСклад",
     });
   }
 });
@@ -1042,22 +1166,41 @@ function validatePayment(payment, total) {
   }
 
   const cash = Number(payment.cash || 0);
-
   const card = Number(payment.card || 0);
-
   const amanat = Number(payment.amanat || 0);
-
   const mplus = Number(payment.mplus || 0);
+  const online_qr = Number(payment.online_qr || 0);
 
-  const values = [cash, card, amanat, mplus];
+  const values = [
+    cash,
+    card,
+    amanat,
+    mplus,
+    online_qr,
+  ];
 
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
-    throw new Error("Суммы оплаты должны быть положительными числами");
+  if (
+    values.some(
+      (value) =>
+        !Number.isFinite(value) || value < 0,
+    )
+  ) {
+    throw new Error(
+      "Суммы оплаты должны быть положительными числами",
+    );
   }
 
-  const paymentTotal = cash + card + amanat + mplus;
+  const paymentTotal =
+    cash +
+    card +
+    amanat +
+    mplus +
+    online_qr;
 
-  if (Math.round(paymentTotal) !== Math.round(total)) {
+  if (
+    Math.round(paymentTotal) !==
+    Math.round(total)
+  ) {
     throw new Error(
       `Сумма оплаты (${paymentTotal}) не равна сумме заказа (${total})`,
     );
@@ -1068,6 +1211,7 @@ function validatePayment(payment, total) {
     card,
     amanat,
     mplus,
+    online_qr,
 
     paymentTotal,
   };
@@ -1208,9 +1352,14 @@ app.post("/api/moysklad/sales", async (req, res) => {
          ОПЛАТА
       ----------------------------------------- */
 
-    const cashSum = normalizedPayment.cash + normalizedPayment.amanat;
+  const cashSum =
+  normalizedPayment.cash;
 
-    const noCashSum = normalizedPayment.card + normalizedPayment.mplus;
+const noCashSum =
+  normalizedPayment.card +
+  normalizedPayment.amanat +
+  normalizedPayment.mplus +
+  normalizedPayment.online_qr;
 
     /* -----------------------------------------
          ТЕКСТ ОПЛАТЫ
@@ -1228,6 +1377,8 @@ app.post("/api/moysklad/sales", async (req, res) => {
       `Аманат: ${(normalizedPayment.amanat / 100).toFixed(2)} сом`,
 
       `М+: ${(normalizedPayment.mplus / 100).toFixed(2)} сом`,
+
+`Онлайн QR: ${(normalizedPayment.online_qr / 100).toFixed(2)} сом`,
 
       `Итого: ${(normalizedTotal / 100).toFixed(2)} сом`,
     ].join("\n");
@@ -1408,27 +1559,34 @@ app.post("/api/moysklad/sales", async (req, res) => {
       })),
 
       // Информация об оплате
-      payment: {
-        method: payment?.method || null,
+     payment: {
+  method: payment?.method || null,
 
-        cash: normalizedPayment.cash,
-        card: normalizedPayment.card,
-        amanat: normalizedPayment.amanat,
-        mplus: normalizedPayment.mplus,
+  cash: normalizedPayment.cash,
+  card: normalizedPayment.card,
+  amanat: normalizedPayment.amanat,
+  mplus: normalizedPayment.mplus,
+  online_qr: normalizedPayment.online_qr,
 
-        cashSom: normalizedPayment.cash / 100,
-        cardSom: normalizedPayment.card / 100,
-        amanatSom: normalizedPayment.amanat / 100,
-        mplusSom: normalizedPayment.mplus / 100,
+  cashSom: normalizedPayment.cash / 100,
+  cardSom: normalizedPayment.card / 100,
+  amanatSom: normalizedPayment.amanat / 100,
+  mplusSom: normalizedPayment.mplus / 100,
+  online_qrSom: normalizedPayment.online_qr / 100,
 
-        paymentTotal: normalizedPayment.paymentTotal,
-      },
+  paymentTotal: normalizedPayment.paymentTotal,
+},
 
       // Суммы, отправленные в документ МойСклад
-      moyskladPayment: {
-        cashSum: cashSum,
-        noCashSum: noCashSum,
-      },
+    moyskladPayment: {
+  cashSum: cashSum,
+  noCashSum: noCashSum,
+
+  card: normalizedPayment.card,
+  amanat: normalizedPayment.amanat,
+  mplus: normalizedPayment.mplus,
+  online_qr: normalizedPayment.online_qr,
+},
 
       // Касса и смена
       // retailStoreId: retailStoreId,
@@ -2226,16 +2384,60 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
 const SALESPERSONS = [
   {
-    id: "seller-001",
-    name: "Продавец 1",
+    id: "seller001",
+    name: "Айсырга",
   },
   {
-    id: "seller-002",
-    name: "Продавец 2",
+    id: "seller002",
+    name: "Айжамал",
   },
   {
-    id: "seller-003",
-    name: "Продавец 3",
+    id: "seller003",
+    name: "Турсунай",
+  },
+  {
+    id: "seller004",
+    name: "Рапия",
+  },
+  {
+    id: "seller005",
+    name: "Камила",
+  },
+  {
+    id: "seller006",
+    name: "Зинаида",
+  },
+  {
+    id: "seller007",
+    name: "Мээрим",
+  },
+  {
+    id: "seller008",
+    name: "Перизат",
+  },
+  {
+    id: "seller009",
+    name: "Сайрагуль",
+  },
+  {
+    id: "seller010",
+    name: "Назик",
+  },
+  {
+    id: "seller011",
+    name: "Бермет",
+  },
+  {
+    id: "seller012",
+    name: "Аида",
+  },
+  {
+    id: "seller013",
+    name: "Малика",
+  },
+  {
+    id: "seller014",
+    name: "Сезим",
   },
 ];
 
