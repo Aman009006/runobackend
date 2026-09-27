@@ -8,7 +8,15 @@ const router = express.Router();
 const DATA_DIR = path.join(__dirname, "..", "data");
 const RESERVATIONS_FILE = path.join(DATA_DIR, "reservations.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
-const PAYMENT_KEYS = ["cash", "card", "amanat", "mplus"];
+
+// Добавили online_qr
+const PAYMENT_KEYS = [
+  "cash",
+  "card",
+  "amanat",
+  "mplus",
+  "online_qr",
+];
 
 async function ensureStorage() {
   await fs.mkdir(DATA_DIR, {
@@ -98,7 +106,6 @@ async function addReservationCashTransaction({
   }
 
   const balanceBefore = roundMoney(toNumber(cashData.balance));
-
   const balanceAfter = roundMoney(balanceBefore + normalizedAmount);
 
   const transaction = {
@@ -120,7 +127,11 @@ async function addReservationCashTransaction({
 
   cashData.transactions.push(transaction);
 
-  await fs.writeFile(CASH_FILE, JSON.stringify(cashData, null, 2), "utf8");
+  await fs.writeFile(
+    CASH_FILE,
+    JSON.stringify(cashData, null, 2),
+    "utf8",
+  );
 
   return transaction;
 }
@@ -153,6 +164,7 @@ function normalizePayments(payments = {}) {
     card: 0,
     amanat: 0,
     mplus: 0,
+    online_qr: 0,
   };
 
   for (const key of PAYMENT_KEYS) {
@@ -180,7 +192,6 @@ function calculateItemsTotal(items = []) {
   return roundMoney(
     items.reduce((total, item) => {
       const price = toNumber(item?.price);
-
       const quantity = toNumber(item?.quantity);
 
       if (price <= 0 || quantity <= 0) {
@@ -202,16 +213,15 @@ function calculatePaymentHistoryTotal(paymentHistory = []) {
   for (const payment of paymentHistory) {
     const type = payment?.type;
 
-    if (type !== "deposit" && type !== "final" && type !== "refund") {
+    if (
+      type !== "deposit" &&
+      type !== "final" &&
+      type !== "refund"
+    ) {
       continue;
     }
 
-    const cash = toNumber(payment?.cash);
-    const card = toNumber(payment?.card);
-    const amanat = toNumber(payment?.amanat);
-    const mplus = toNumber(payment?.mplus);
-
-    const amount = cash + card + amanat + mplus;
+    const amount = calculatePaymentTotal(payment);
 
     if (type === "refund") {
       total -= amount;
@@ -231,7 +241,10 @@ function getPaymentHistoryPaid(paymentHistory = []) {
   let total = 0;
 
   for (const payment of paymentHistory) {
-    if (payment?.type !== "deposit" && payment?.type !== "final") {
+    if (
+      payment?.type !== "deposit" &&
+      payment?.type !== "final"
+    ) {
       continue;
     }
 
@@ -255,13 +268,14 @@ function getPaymentCount(paymentHistory = []) {
   }
 
   return paymentHistory.filter(
-    (payment) => payment?.type === "deposit" || payment?.type === "final",
+    (payment) =>
+      payment?.type === "deposit" ||
+      payment?.type === "final",
   ).length;
 }
 
 function getPaymentStatus(total, paid) {
   const normalizedTotal = roundMoney(total);
-
   const normalizedPaid = roundMoney(paid);
 
   if (normalizedPaid <= 0) {
@@ -282,23 +296,20 @@ function buildPaymentHistoryEntry(type, payments) {
     id: createId("payment"),
     type,
     createdAt: getNow(),
+
     cash: normalized.cash,
     card: normalized.card,
     amanat: normalized.amanat,
     mplus: normalized.mplus,
+
+    // Новый способ оплаты
+    online_qr: normalized.online_qr,
   };
 }
 
 /**
  * Для старых броней, где paymentHistory
  * ещё отсутствует.
- *
- * Старую предоплату считаем проведённой
- * в момент создания брони.
- *
- * Если старая бронь уже cancelled,
- * исторически считаем её возвращённой,
- * чтобы она не продолжала увеличивать кассу.
  */
 function ensurePaymentHistory(reservation) {
   if (Array.isArray(reservation.paymentHistory)) {
@@ -320,10 +331,13 @@ function ensurePaymentHistory(reservation) {
       id: createId("payment"),
       type: "deposit",
       createdAt,
+
       cash: payments.cash,
       card: payments.card,
       amanat: payments.amanat,
       mplus: payments.mplus,
+
+      online_qr: payments.online_qr,
     },
   ];
 
@@ -332,10 +346,13 @@ function ensurePaymentHistory(reservation) {
       id: createId("payment"),
       type: "refund",
       createdAt: reservation.updatedAt || getNow(),
+
       cash: payments.cash,
       card: payments.card,
       amanat: payments.amanat,
       mplus: payments.mplus,
+
+      online_qr: payments.online_qr,
     });
   }
 
@@ -351,15 +368,24 @@ function normalizeReservation(reservation) {
 
   const paid = getPaymentHistoryPaid(paymentHistory);
 
-  const remaining = Math.max(0, roundMoney(total - paid));
+  const remaining = Math.max(
+    0,
+    roundMoney(total - paid),
+  );
 
   return {
     ...reservation,
+
     total,
+
     payments,
+
     paid,
+
     remaining,
+
     paymentStatus: getPaymentStatus(total, paid),
+
     paymentHistory,
   };
 }
@@ -368,9 +394,6 @@ function normalizeReservation(reservation) {
  * POST /api/reservations
  *
  * Создание новой брони.
- *
- * Если клиент сразу внёс деньги,
- * это первый платёж — deposit.
  */
 router.post("/", async (req, res) => {
   try {
@@ -384,21 +407,30 @@ router.post("/", async (req, res) => {
       comment,
     } = req.body;
 
-    if (typeof customerName !== "string" || !customerName.trim()) {
+    if (
+      typeof customerName !== "string" ||
+      !customerName.trim()
+    ) {
       return res.status(400).json({
         success: false,
         message: "Введите имя клиента",
       });
     }
 
-    if (typeof customerPhone !== "string" || !customerPhone.trim()) {
+    if (
+      typeof customerPhone !== "string" ||
+      !customerPhone.trim()
+    ) {
       return res.status(400).json({
         success: false,
         message: "Введите телефон клиента",
       });
     }
 
-    if (typeof reservationDate !== "string" || !reservationDate) {
+    if (
+      typeof reservationDate !== "string" ||
+      !reservationDate
+    ) {
       return res.status(400).json({
         success: false,
         message: "Выберите дату брони",
@@ -423,12 +455,14 @@ router.post("/", async (req, res) => {
 
     const normalizedPayments = normalizePayments(payments);
 
-    const paymentTotal = calculatePaymentTotal(normalizedPayments);
+    const paymentTotal =
+      calculatePaymentTotal(normalizedPayments);
 
     if (paymentTotal > total) {
       return res.status(400).json({
         success: false,
-        message: "Сумма оплаты не может быть больше суммы брони",
+        message:
+          "Сумма оплаты не может быть больше суммы брони",
       });
     }
 
@@ -438,13 +472,18 @@ router.post("/", async (req, res) => {
 
     if (paymentTotal > 0) {
       paymentHistory.push(
-        buildPaymentHistoryEntry("deposit", normalizedPayments),
+        buildPaymentHistoryEntry(
+          "deposit",
+          normalizedPayments,
+        ),
       );
     }
 
     const paid = paymentTotal;
 
-    const remaining = roundMoney(Math.max(0, total - paid));
+    const remaining = roundMoney(
+      Math.max(0, total - paid),
+    );
 
     const reservation = {
       id: createId("reservation"),
@@ -459,7 +498,10 @@ router.post("/", async (req, res) => {
 
       paymentMethod: paymentMethod || "cash",
 
-      comment: typeof comment === "string" ? comment.trim() : "",
+      comment:
+        typeof comment === "string"
+          ? comment.trim()
+          : "",
 
       status: "reserved",
 
@@ -474,7 +516,10 @@ router.post("/", async (req, res) => {
 
       remaining,
 
-      paymentStatus: getPaymentStatus(total, paid),
+      paymentStatus: getPaymentStatus(
+        total,
+        paid,
+      ),
 
       paymentHistory,
     };
@@ -485,6 +530,7 @@ router.post("/", async (req, res) => {
 
     await writeReservations(reservations);
 
+    // Только наличные идут в cash.json
     if (normalizedPayments.cash > 0) {
       await addReservationCashTransaction({
         amount: normalizedPayments.cash,
@@ -499,11 +545,16 @@ router.post("/", async (req, res) => {
       reservation,
     });
   } catch (error) {
-    console.error("Ошибка создания брони:", error);
+    console.error(
+      "Ошибка создания брони:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось создать бронь",
+      message:
+        error.message ||
+        "Не удалось создать бронь",
     });
   }
 });
@@ -515,53 +566,30 @@ router.get("/", async (req, res) => {
   try {
     const reservations = await readReservations();
 
-    const normalized = reservations.map(normalizeReservation);
+    const normalized =
+      reservations.map(normalizeReservation);
 
     return res.json({
       success: true,
       reservations: normalized,
     });
   } catch (error) {
-    console.error("Ошибка получения броней:", error);
+    console.error(
+      "Ошибка получения броней:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось получить брони",
+      message:
+        error.message ||
+        "Не удалось получить брони",
     });
   }
 });
 
 /**
  * PATCH /api/reservations/:id
- *
- * Изменение брони.
- *
- * ВАЖНАЯ ЛОГИКА:
- *
- * Было:
- * total = 10000
- * paid = 5000
- *
- * Стало:
- * total = 4000
- *
- * Получаем переплату:
- * 5000 - 4000 = 1000
- *
- * Backend создаёт refund на 1000
- * с текущей датой.
- *
- * То есть:
- *
- * deposit +5000
- * refund  -1000
- *
- * Итог:
- * paid = 4000
- * remaining = 0
- *
- * Для кассы refund уменьшит
- * текущую сумму на 1000 сом.
  */
 router.patch("/:id", async (req, res) => {
   try {
@@ -579,7 +607,8 @@ router.patch("/:id", async (req, res) => {
     const reservations = await readReservations();
 
     const index = reservations.findIndex(
-      (reservation) => reservation.id === id,
+      (reservation) =>
+        reservation.id === id,
     );
 
     if (index === -1) {
@@ -589,37 +618,51 @@ router.patch("/:id", async (req, res) => {
       });
     }
 
-    const current = normalizeReservation(reservations[index]);
+    const current =
+      normalizeReservation(
+        reservations[index],
+      );
 
     if (current.status === "cancelled") {
       return res.status(400).json({
         success: false,
-        message: "Нельзя изменить отменённую бронь",
+        message:
+          "Нельзя изменить отменённую бронь",
       });
     }
 
     if (current.status === "issued") {
       return res.status(400).json({
         success: false,
-        message: "Нельзя изменить выданную бронь",
+        message:
+          "Нельзя изменить выданную бронь",
       });
     }
 
-    if (typeof customerName !== "string" || !customerName.trim()) {
+    if (
+      typeof customerName !== "string" ||
+      !customerName.trim()
+    ) {
       return res.status(400).json({
         success: false,
         message: "Введите имя клиента",
       });
     }
 
-    if (typeof customerPhone !== "string" || !customerPhone.trim()) {
+    if (
+      typeof customerPhone !== "string" ||
+      !customerPhone.trim()
+    ) {
       return res.status(400).json({
         success: false,
         message: "Введите телефон клиента",
       });
     }
 
-    if (typeof reservationDate !== "string" || !reservationDate) {
+    if (
+      typeof reservationDate !== "string" ||
+      !reservationDate
+    ) {
       return res.status(400).json({
         success: false,
         message: "Выберите дату брони",
@@ -633,88 +676,74 @@ router.patch("/:id", async (req, res) => {
       });
     }
 
-    const newTotal = calculateItemsTotal(items);
+    const newTotal =
+      calculateItemsTotal(items);
 
     if (newTotal <= 0) {
       return res.status(400).json({
         success: false,
-        message: "Сумма брони должна быть больше нуля",
+        message:
+          "Сумма брони должна быть больше нуля",
       });
     }
 
-    /**
-     * paymentHistory берём из текущей
-     * брони, а не из frontend.
-     *
-     * Это важно, потому что frontend
-     * не должен создавать финансовую
-     * историю самостоятельно.
-     */
-    const paymentHistory = [...ensurePaymentHistory(current)];
+    const paymentHistory = [
+      ...ensurePaymentHistory(current),
+    ];
 
-    /**
-     * Сколько реально было оплачено
-     * до изменения заказа.
-     */
-    const oldPaid = getPaymentHistoryPaid(paymentHistory);
+    const oldPaid =
+      getPaymentHistoryPaid(
+        paymentHistory,
+      );
 
-    /**
-     * Если новый total меньше уже
-     * оплаченной суммы, возникает
-     * переплата.
-     *
-     * Пример:
-     *
-     * oldPaid = 5000
-     * newTotal = 4000
-     *
-     * refund = 1000
-     */
-    const overpayment = roundMoney(Math.max(0, oldPaid - newTotal));
+    const overpayment = roundMoney(
+      Math.max(
+        0,
+        oldPaid - newTotal,
+      ),
+    );
 
     if (overpayment > 0) {
-      /**
-       * В текущей бизнес-логике
-       * эта разница возвращается
-       * наличными.
-       *
-       * Поэтому в кассе сегодня
-       * будет:
-       *
-       * -1000 сом
-       */
       paymentHistory.push(
-        buildPaymentHistoryEntry("refund", {
-          cash: overpayment,
-          card: 0,
-          amanat: 0,
-          mplus: 0,
-        }),
+        buildPaymentHistoryEntry(
+          "refund",
+          {
+            cash: overpayment,
+            card: 0,
+            amanat: 0,
+            mplus: 0,
+            online_qr: 0,
+          },
+        ),
       );
     }
 
-    /**
-     * После возможного возврата
-     * рассчитываем новую оплаченную
-     * сумму.
-     */
-    const newPaid = Math.max(0, roundMoney(oldPaid - overpayment));
+    const newPaid = Math.max(
+      0,
+      roundMoney(
+        oldPaid - overpayment,
+      ),
+    );
 
-    const newRemaining = Math.max(0, roundMoney(newTotal - newPaid));
+    const newRemaining = Math.max(
+      0,
+      roundMoney(
+        newTotal - newPaid,
+      ),
+    );
 
-    /**
-     * Сохраняем старые payments,
-     * но уменьшаем их на возврат.
-     *
-     * В обычном сценарии возврат
-     * наличными относится к cash.
-     */
-    const newPayments = normalizePayments(current.payments);
+    const newPayments =
+      normalizePayments(
+        current.payments,
+      );
 
     if (overpayment > 0) {
       newPayments.cash = Math.max(
         0,
-        roundMoney(newPayments.cash - overpayment),
+        roundMoney(
+          newPayments.cash -
+            overpayment,
+        ),
       );
     }
 
@@ -723,17 +752,25 @@ router.patch("/:id", async (req, res) => {
     const updatedReservation = {
       ...current,
 
-      customerName: customerName.trim(),
+      customerName:
+        customerName.trim(),
 
-      customerPhone: customerPhone.trim(),
+      customerPhone:
+        customerPhone.trim(),
 
       reservationDate,
 
       items,
 
-      paymentMethod: paymentMethod || current.paymentMethod || "cash",
+      paymentMethod:
+        paymentMethod ||
+        current.paymentMethod ||
+        "cash",
 
-      comment: typeof comment === "string" ? comment.trim() : "",
+      comment:
+        typeof comment === "string"
+          ? comment.trim()
+          : "",
 
       total: newTotal,
 
@@ -743,29 +780,39 @@ router.patch("/:id", async (req, res) => {
 
       remaining: newRemaining,
 
-      paymentStatus: getPaymentStatus(newTotal, newPaid),
+      paymentStatus:
+        getPaymentStatus(
+          newTotal,
+          newPaid,
+        ),
 
       paymentHistory,
 
       updatedAt,
     };
 
-    reservations[index] = updatedReservation;
+    reservations[index] =
+      updatedReservation;
 
-    await writeReservations(reservations);
+    await writeReservations(
+      reservations,
+    );
 
     if (overpayment > 0) {
       await addReservationCashTransaction({
         amount: -overpayment,
-        reservationId: updatedReservation.id,
-        customerName: updatedReservation.customerName,
+        reservationId:
+          updatedReservation.id,
+        customerName:
+          updatedReservation.customerName,
         type: "reservation",
       });
     }
 
     return res.json({
       success: true,
-      reservation: updatedReservation,
+      reservation:
+        updatedReservation,
       refund: overpayment,
 
       refundPayment:
@@ -776,15 +823,21 @@ router.patch("/:id", async (req, res) => {
               card: 0,
               amanat: 0,
               mplus: 0,
+              online_qr: 0,
             }
           : null,
     });
   } catch (error) {
-    console.error("Ошибка изменения брони:", error);
+    console.error(
+      "Ошибка изменения брони:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось изменить бронь",
+      message:
+        error.message ||
+        "Не удалось изменить бронь",
     });
   }
 });
@@ -792,20 +845,26 @@ router.patch("/:id", async (req, res) => {
 /**
  * POST /api/reservations/:id/payment
  *
- * Второй и последний платёж —
- * полный выкуп остатка.
+ * Второй и последний платёж.
  */
 router.post("/:id/payment", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { paymentMethod, payments, paymentType } = req.body;
+    const {
+      paymentMethod,
+      payments,
+      paymentType,
+    } = req.body;
 
-    const reservations = await readReservations();
+    const reservations =
+      await readReservations();
 
-    const index = reservations.findIndex(
-      (reservation) => reservation.id === id,
-    );
+    const index =
+      reservations.findIndex(
+        (reservation) =>
+          reservation.id === id,
+      );
 
     if (index === -1) {
       return res.status(404).json({
@@ -814,65 +873,86 @@ router.post("/:id/payment", async (req, res) => {
       });
     }
 
-    const current = normalizeReservation(reservations[index]);
+    const current =
+      normalizeReservation(
+        reservations[index],
+      );
 
-    if (current.status === "cancelled") {
+    if (
+      current.status ===
+      "cancelled"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Нельзя внести оплату по отменённой брони",
+        message:
+          "Нельзя внести оплату по отменённой брони",
       });
     }
 
-    if (current.status === "issued") {
+    if (
+      current.status ===
+      "issued"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Бронь уже выдана",
+        message:
+          "Бронь уже выдана",
       });
     }
 
     if (current.remaining <= 0) {
       return res.status(400).json({
         success: false,
-        message: "По этой брони уже нет остатка",
+        message:
+          "По этой брони уже нет остатка",
       });
     }
 
-    const paymentHistory = [...ensurePaymentHistory(current)];
+    const paymentHistory = [
+      ...ensurePaymentHistory(current),
+    ];
 
-    const paymentCount = getPaymentCount(paymentHistory);
+    const paymentCount =
+      getPaymentCount(
+        paymentHistory,
+      );
 
-    /**
-     * Максимум два платежа:
-     *
-     * 1. deposit
-     * 2. final
-     */
     if (paymentCount >= 2) {
       return res.status(400).json({
         success: false,
-        message: "По брони уже было максимально два платежа",
+        message:
+          "По брони уже было максимально два платежа",
       });
     }
 
-    const normalizedPayments = normalizePayments(payments);
+    const normalizedPayments =
+      normalizePayments(
+        payments,
+      );
 
-    const paymentTotal = calculatePaymentTotal(normalizedPayments);
+    const paymentTotal =
+      calculatePaymentTotal(
+        normalizedPayments,
+      );
 
     if (paymentTotal <= 0) {
       return res.status(400).json({
         success: false,
-        message: "Введите сумму оплаты",
+        message:
+          "Введите сумму оплаты",
       });
     }
 
-    /**
-     * Второй платёж должен закрывать
-     * весь оставшийся долг.
-     */
-    if (paymentTotal !== roundMoney(current.remaining)) {
+    if (
+      paymentTotal !==
+      roundMoney(
+        current.remaining,
+      )
+    ) {
       return res.status(400).json({
         success: false,
-        message: `Второй платёж должен полностью закрыть остаток: ${current.remaining} сом`,
+        message:
+          `Второй платёж должен полностью закрыть остаток: ${current.remaining} сом`,
       });
     }
 
@@ -883,90 +963,131 @@ router.post("/:id/payment", async (req, res) => {
           ? "deposit"
           : "final";
 
-    paymentHistory.push(buildPaymentHistoryEntry(type, normalizedPayments));
+    paymentHistory.push(
+      buildPaymentHistoryEntry(
+        type,
+        normalizedPayments,
+      ),
+    );
 
-    const newPayments = normalizePayments(current.payments);
+    const newPayments =
+      normalizePayments(
+        current.payments,
+      );
 
     for (const key of PAYMENT_KEYS) {
-      newPayments[key] = roundMoney(newPayments[key] + normalizedPayments[key]);
+      newPayments[key] =
+        roundMoney(
+          newPayments[key] +
+            normalizedPayments[key],
+        );
     }
 
-    const newPaid = roundMoney(current.paid + paymentTotal);
+    const newPaid =
+      roundMoney(
+        current.paid +
+          paymentTotal,
+      );
 
-    const newRemaining = Math.max(0, roundMoney(current.total - newPaid));
+    const newRemaining =
+      Math.max(
+        0,
+        roundMoney(
+          current.total -
+            newPaid,
+        ),
+      );
 
     const updatedReservation = {
       ...current,
 
-      payments: newPayments,
+      payments:
+        newPayments,
 
-      paid: newPaid,
+      paid:
+        newPaid,
 
-      remaining: newRemaining,
+      remaining:
+        newRemaining,
 
-      paymentStatus: getPaymentStatus(current.total, newPaid),
+      paymentStatus:
+        getPaymentStatus(
+          current.total,
+          newPaid,
+        ),
 
       paymentHistory,
 
-      paymentMethod: paymentMethod || current.paymentMethod || "cash",
+      paymentMethod:
+        paymentMethod ||
+        current.paymentMethod ||
+        "cash",
 
       updatedAt: getNow(),
     };
 
-    reservations[index] = updatedReservation;
+    reservations[index] =
+      updatedReservation;
 
-    await writeReservations(reservations);
+    await writeReservations(
+      reservations,
+    );
 
-    if (normalizedPayments.cash > 0) {
+    // Только cash увеличивает cash.json
+    if (
+      normalizedPayments.cash >
+      0
+    ) {
       await addReservationCashTransaction({
-        amount: normalizedPayments.cash,
-        reservationId: updatedReservation.id,
-        customerName: updatedReservation.customerName,
-        type: "reservation",
+        amount:
+          normalizedPayments.cash,
+
+        reservationId:
+          updatedReservation.id,
+
+        customerName:
+          updatedReservation.customerName,
+
+        type:
+          "reservation",
       });
     }
 
     return res.json({
       success: true,
-      reservation: updatedReservation,
+      reservation:
+        updatedReservation,
     });
   } catch (error) {
-    console.error("Ошибка внесения оплаты:", error);
+    console.error(
+      "Ошибка внесения оплаты:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось внести оплату",
+      message:
+        error.message ||
+        "Не удалось внести оплату",
     });
   }
 });
 
 /**
  * POST /api/reservations/:id/cancel
- *
- * Отмена брони.
- *
- * Если по ней были деньги,
- * создаём refund сегодняшней датой.
- *
- * Это НЕ удаляет старый deposit.
- *
- * В истории будет:
- *
- * deposit +5000
- * refund  -5000
- *
- * Поэтому касса корректно получит
- * чистый финансовый результат.
  */
 router.post("/:id/cancel", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const reservations = await readReservations();
+    const reservations =
+      await readReservations();
 
-    const index = reservations.findIndex(
-      (reservation) => reservation.id === id,
-    );
+    const index =
+      reservations.findIndex(
+        (reservation) =>
+          reservation.id === id,
+      );
 
     if (index === -1) {
       return res.status(404).json({
@@ -975,104 +1096,139 @@ router.post("/:id/cancel", async (req, res) => {
       });
     }
 
-    const current = normalizeReservation(reservations[index]);
+    const current =
+      normalizeReservation(
+        reservations[index],
+      );
 
-    if (current.status === "cancelled") {
+    if (
+      current.status ===
+      "cancelled"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Бронь уже отменена",
+        message:
+          "Бронь уже отменена",
       });
     }
 
-    if (current.status === "issued") {
+    if (
+      current.status ===
+      "issued"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Нельзя отменить выданную бронь",
+        message:
+          "Нельзя отменить выданную бронь",
       });
     }
 
-    const paymentHistory = [...ensurePaymentHistory(current)];
+    const paymentHistory = [
+      ...ensurePaymentHistory(current),
+    ];
 
-    /**
-     * Возвращаем всю фактически
-     * оплаченную сумму.
-     *
-     * Для кассы важна cash-часть.
-     */
-    const refundPayments = normalizePayments(current.payments);
+    const refundPayments =
+      normalizePayments(
+        current.payments,
+      );
 
-    const refundTotal = calculatePaymentTotal(refundPayments);
+    const refundTotal =
+      calculatePaymentTotal(
+        refundPayments,
+      );
 
     if (refundTotal > 0) {
-      paymentHistory.push(buildPaymentHistoryEntry("refund", refundPayments));
+      paymentHistory.push(
+        buildPaymentHistoryEntry(
+          "refund",
+          refundPayments,
+        ),
+      );
     }
 
     const updatedReservation = {
       ...current,
 
-      status: "cancelled",
+      status:
+        "cancelled",
 
-      updatedAt: getNow(),
+      updatedAt:
+        getNow(),
 
       paymentHistory,
 
-      /**
-       * payments оставляем как
-       * исторически внесённые суммы.
-       *
-       * Финансовый результат определяется
-       * через paymentHistory.
-       */
-      paid: current.paid,
+      paid:
+        current.paid,
 
-      remaining: current.remaining,
+      remaining:
+        current.remaining,
     };
 
-    reservations[index] = updatedReservation;
+    reservations[index] =
+      updatedReservation;
 
-    await writeReservations(reservations);
+    await writeReservations(
+      reservations,
+    );
 
-    if (refundPayments.cash > 0) {
+    // При отмене в cash.json
+    // возвращаем только наличную часть.
+    if (
+      refundPayments.cash >
+      0
+    ) {
       await addReservationCashTransaction({
-        amount: -refundPayments.cash,
-        reservationId: updatedReservation.id,
-        customerName: updatedReservation.customerName,
-        type: "reservation",
+        amount:
+          -refundPayments.cash,
+
+        reservationId:
+          updatedReservation.id,
+
+        customerName:
+          updatedReservation.customerName,
+
+        type:
+          "reservation",
       });
     }
 
     return res.json({
       success: true,
-      reservation: updatedReservation,
-      refund: refundTotal,
+      reservation:
+        updatedReservation,
+      refund:
+        refundTotal,
     });
   } catch (error) {
-    console.error("Ошибка отмены брони:", error);
+    console.error(
+      "Ошибка отмены брони:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось отменить бронь",
+      message:
+        error.message ||
+        "Не удалось отменить бронь",
     });
   }
 });
 
 /**
  * POST /api/reservations/:id/issue
- *
- * Выдача брони.
- *
- * Выдавать можно только полностью
- * оплаченную бронь.
  */
 router.post("/:id/issue", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const reservations = await readReservations();
+    const reservations =
+      await readReservations();
 
-    const index = reservations.findIndex(
-      (reservation) => reservation.id === id,
-    );
+    const index =
+      reservations.findIndex(
+        (reservation) =>
+          reservation.id === id,
+      );
 
     if (index === -1) {
       return res.status(404).json({
@@ -1081,51 +1237,74 @@ router.post("/:id/issue", async (req, res) => {
       });
     }
 
-    const current = normalizeReservation(reservations[index]);
+    const current =
+      normalizeReservation(
+        reservations[index],
+      );
 
-    if (current.status === "cancelled") {
+    if (
+      current.status ===
+      "cancelled"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Нельзя выдать отменённую бронь",
+        message:
+          "Нельзя выдать отменённую бронь",
       });
     }
 
-    if (current.status === "issued") {
+    if (
+      current.status ===
+      "issued"
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Бронь уже выдана",
+        message:
+          "Бронь уже выдана",
       });
     }
 
     if (current.remaining > 0) {
       return res.status(400).json({
         success: false,
-        message: `Нельзя выдать бронь. Остаток: ${current.remaining} сом`,
+        message:
+          `Нельзя выдать бронь. Остаток: ${current.remaining} сом`,
       });
     }
 
     const updatedReservation = {
       ...current,
 
-      status: "issued",
+      status:
+        "issued",
 
-      updatedAt: getNow(),
+      updatedAt:
+        getNow(),
     };
 
-    reservations[index] = updatedReservation;
+    reservations[index] =
+      updatedReservation;
 
-    await writeReservations(reservations);
+    await writeReservations(
+      reservations,
+    );
 
     return res.json({
       success: true,
-      reservation: updatedReservation,
+      reservation:
+        updatedReservation,
     });
   } catch (error) {
-    console.error("Ошибка выдачи брони:", error);
+    console.error(
+      "Ошибка выдачи брони:",
+      error,
+    );
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Не удалось выдать бронь",
+      message:
+        error.message ||
+        "Не удалось выдать бронь",
     });
   }
 });
