@@ -9,7 +9,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: "https://runo-rouge.vercel.app",
+    origin: "http://localhost:3000",
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -60,8 +60,6 @@ const SALES_FILE = path.join(DATA_DIR, "sales.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
 const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
 
-app.use(cors());
-app.use(express.json());
 
 // Создаем папку data
 if (!fs.existsSync(DATA_DIR)) {
@@ -890,202 +888,612 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
    PRODUCTS
 ========================================================= */
 
-app.get("/api/moysklad/products", async (req, res) => {
+/* =========================================================
+   РАССЧИТАТЬ ОСТАТОК КОМПЛЕКТА
+========================================================= */
+
+async function calculateBundleStock(bundle, stockRows) {
   try {
-    const storeId = req.query.storeId || YOUNG_GUARD_ID;
+    const bundleId = bundle.id;
 
-    console.log("Получаем товары склада:", storeId);
+    if (!bundleId) {
+      return 0;
+    }
 
-    const storeHref = `${MOYSKLAD_API}/entity/store/${storeId}`;
-    const filterParam = encodeURIComponent(`store=${storeHref}`);
+const components = await getBundleComponents(bundleId);
 
-    // =====================================================
-    // 1. ОСТАТКИ ОБЫЧНЫХ ТОВАРОВ
-    // =====================================================
+    if (components.length === 0) {
+      console.log(
+        `Комплект "${bundle.name}" не имеет компонентов`,
+      );
 
-    const stockData = await moySkladRequest(
-      `/report/stock/all?filter=${filterParam}&limit=1000`,
+      return 0;
+    }
+
+    let possibleBundles = Infinity;
+
+    for (const component of components) {
+      const componentQuantity = Number(component.quantity || 0);
+
+      if (
+        !Number.isFinite(componentQuantity) ||
+        componentQuantity <= 0
+      ) {
+        continue;
+      }
+
+      const componentMeta = component.assortment?.meta;
+
+      if (!componentMeta?.href) {
+        console.warn(
+          `У компонента комплекта "${bundle.name}" нет assortment.meta`,
+          component,
+        );
+
+        return 0;
+      }
+
+      /*
+       * ID товара/модификации
+       */
+
+      const componentHref = componentMeta.href
+        .split("?")[0];
+
+      const componentId = componentHref
+        .split("/")
+        .pop();
+
+      /*
+       * Ищем остаток компонента
+       */
+
+      const stockItem = stockRows.find((item) => {
+        const href = item.meta?.href
+          ?.split("?")[0];
+
+        const id = href?.split("/").pop();
+
+        return (
+          id === componentId &&
+          (
+            item.meta?.type === componentMeta.type ||
+            !componentMeta.type
+          )
+        );
+      });
+
+      const stock = Number(stockItem?.stock || 0);
+
+      /*
+       * Сколько комплектов можно собрать
+       * из этого компонента
+       */
+
+      const componentBundles =
+        Math.floor(stock / componentQuantity);
+
+      possibleBundles = Math.min(
+        possibleBundles,
+        componentBundles,
+      );
+
+      /*
+       * Если хотя бы одного компонента нет —
+       * комплектов тоже нет.
+       */
+
+      if (possibleBundles <= 0) {
+        return 0;
+      }
+    }
+
+    if (!Number.isFinite(possibleBundles)) {
+      return 0;
+    }
+
+    return possibleBundles;
+  } catch (error) {
+    console.error(
+      `Ошибка расчёта остатка комплекта "${bundle.name}":`,
+      error,
     );
 
-    const stockRows = stockData.rows || [];
+    return 0;
+  }
+}
 
-    console.log(`Получено товаров со склада: ${stockRows.length}`);
+const bundleComponentsCache = new Map();
 
-    // =====================================================
-    // 2. ПОЛУЧАЕМ КОМПЛЕКТЫ
-    // =====================================================
+const BUNDLE_CACHE_TTL = 5 * 60 * 1000; // 5 минут
 
-    const bundleData = await moySkladRequest(
-      `/entity/bundle?limit=1000`,
+
+// =========================================================
+// PRODUCTS CACHE
+// =========================================================
+
+const productsCache = new Map();
+
+const PRODUCTS_CACHE_TTL = 5 * 60 * 1000;
+
+// Чтобы несколько запросов одновременно
+// не запускали несколько одинаковых загрузок
+const productsLoading = new Map();
+
+async function getBundleComponents(bundleId) {
+  const cached = bundleComponentsCache.get(bundleId);
+
+  if (
+    cached &&
+    Date.now() - cached.timestamp < BUNDLE_CACHE_TTL
+  ) {
+    return cached.components;
+  }
+
+  const data = await moySkladRequest(
+    `/entity/bundle/${bundleId}/components?limit=100&expand=assortment`,
+  );
+
+  const components = data?.rows || [];
+
+  bundleComponentsCache.set(bundleId, {
+    timestamp: Date.now(),
+    components,
+  });
+
+  return components;
+}
+async function refreshProductsCache(storeId) {
+  /*
+   * =====================================================
+   * ЕСЛИ ОБНОВЛЕНИЕ УЖЕ ИДЁТ
+   * =====================================================
+   */
+
+  if (productsLoading.has(storeId)) {
+    console.log(
+      `PRODUCTS: обновление уже выполняется для ${storeId}`,
     );
 
-    const bundles = bundleData.rows || [];
+    return productsLoading.get(storeId);
+  }
 
-    console.log(`Получено комплектов: ${bundles.length}`);
+  /*
+   * =====================================================
+   * СОЗДАЁМ PROMISE ОБНОВЛЕНИЯ
+   * =====================================================
+   */
 
-    // =====================================================
-    // 3. ПРЕОБРАЗУЕМ ОБЫЧНЫЕ ТОВАРЫ
-    // =====================================================
+  const loadingPromise = (async () => {
+    try {
+      console.log("================================");
+      console.log("ОБНОВЛЕНИЕ PRODUCTS");
+      console.log("Store:", storeId);
+      console.log("================================");
 
-  const products = stockRows.map((item) => {
-  const rawHref = item.meta?.href || "";
+      const storeHref =
+        `${MOYSKLAD_API}/entity/store/${storeId}`;
 
-  const cleanHref = rawHref.split("?")[0];
+      const filterParam = encodeURIComponent(
+        `store=${storeHref}`,
+      );
 
-  const productId = cleanHref.split("/").pop() || "";
+      /*
+       * =================================================
+       * 1. ОСТАТКИ
+       * =================================================
+       */
 
-  // Цена продажи
-  const price = item.salePrice
-    ? item.salePrice / 100
-    : 0;
+      const stockData = await moySkladRequest(
+        `/report/stock/all?filter=${filterParam}&limit=1000`,
+      );
 
-  // Старая себестоимость — оставляем без изменений
-  const buyPrice = item.price
-    ? item.price / 100
-    : 0;
+      const stockRows = stockData?.rows || [];
 
-  // Новое отдельное поле себестоимости
-  const costPrice = item.price
-    ? item.price / 100
-    : 0;
+      console.log(
+        `Получено товаров со склада: ${stockRows.length}`,
+      );
 
-  return {
-    id: productId,
+      /*
+       * =================================================
+       * 2. КОМПЛЕКТЫ
+       * =================================================
+       */
 
-    name: item.name || "Товар без названия",
+      const bundleData = await moySkladRequest(
+        `/entity/bundle?limit=1000`,
+      );
 
-    code: item.code || "",
+      const bundles = bundleData?.rows || [];
 
-    article: item.article || "",
+      console.log(
+        `Получено комплектов: ${bundles.length}`,
+      );
 
-    // Цена продажи
-    price,
+      /*
+       * =================================================
+       * 3. ОБЫЧНЫЕ ТОВАРЫ
+       * =================================================
+       */
 
-    // Старая логика — НЕ УДАЛЯЕМ
-    buyPrice,
+      const products = stockRows.map((item) => {
+        const rawHref = item.meta?.href || "";
 
-    // Новое поле себестоимости
-    costPrice,
+        const cleanHref = rawHref.split("?")[0];
 
-    stock: Number(item.stock || 0),
+        const productId =
+          cleanHref.split("/").pop() || "";
 
-    reserve: Number(item.reserve || 0),
-
-    inTransit: Number(item.inTransit || 0),
-
-    reserveStock: Number(item.reserveStock || 0),
-
-    meta: item.meta,
-
-    uom: item.uom?.name || "шт",
-
-    pathName:
-      item.folder?.name ||
-      item.productFolder?.name ||
-      "Общая категория",
-
-    description: item.description || "",
-
-    type: item.meta?.type || "product",
-
-    isBundle: false,
-  };
-});
-
-    // =====================================================
-    // 4. ДОБАВЛЯЕМ КОМПЛЕКТЫ
-    // =====================================================
-
-    const bundleProducts = bundles.map((bundle) => {
-      const rawHref = bundle.meta?.href || "";
-
-      const cleanHref = rawHref.split("?")[0];
-
-      const bundleId = cleanHref.split("/").pop() || "";
-
-      // salePrices содержит цены комплекта
-      const price =
-        bundle.salePrices?.[0]?.value != null
-          ? bundle.salePrices[0].value / 100
+        const price = item.salePrice
+          ? item.salePrice / 100
           : 0;
 
-      const buyPrice =
-        bundle.buyPrice != null
-          ? bundle.buyPrice / 100
+        const buyPrice = item.price
+          ? item.price / 100
           : 0;
 
-      return {
-        id: bundleId,
+        const costPrice = item.price
+          ? item.price / 100
+          : 0;
 
-        name: bundle.name || "Комплект без названия",
+        return {
+          id: productId,
 
-        code: bundle.code || "",
+          name: item.name || "Товар без названия",
 
-        article: bundle.article || "",
+          code: item.code || "",
 
-        price,
+          article: item.article || "",
 
-        buyPrice,
+          price,
 
-        // Пока ставим 0.
-        // Остаток комплекта нужно рассчитывать
-        // отдельно из его компонентов.
-        stock: 0,
+          buyPrice,
 
-        reserve: 0,
+          costPrice,
 
-        inTransit: 0,
+          stock: Number(item.stock || 0),
 
-        meta: bundle.meta,
+          reserve: Number(item.reserve || 0),
 
-        uom: bundle.uom?.name || "шт",
+          inTransit: Number(item.inTransit || 0),
 
-        pathName:
-          bundle.productFolder?.name ||
-          bundle.folder?.name ||
-          "Общая категория",
+          reserveStock: Number(
+            item.reserveStock || 0,
+          ),
 
-        description: bundle.description || "",
+          meta: item.meta,
 
-        type: "bundle",
+          uom:
+            item.uom?.name || "шт",
 
-        isBundle: true,
+          pathName:
+            item.folder?.name ||
+            item.productFolder?.name ||
+            "Общая категория",
+
+          description:
+            item.description || "",
+
+          type:
+            item.meta?.type || "product",
+
+          isBundle: false,
+        };
+      });
+
+      /*
+       * =================================================
+       * 4. КОМПЛЕКТЫ
+       * =================================================
+       */
+
+      const bundleProducts = [];
+
+      for (const bundle of bundles) {
+        try {
+          const rawHref =
+            bundle.meta?.href || "";
+
+          const cleanHref =
+            rawHref.split("?")[0];
+
+          const bundleId =
+            cleanHref.split("/").pop() || "";
+
+          const price =
+            bundle.salePrices?.[0]?.value != null
+              ? bundle.salePrices[0].value / 100
+              : 0;
+
+          const buyPrice =
+            bundle.buyPrice != null
+              ? bundle.buyPrice / 100
+              : 0;
+
+          const stock =
+            await calculateBundleStock(
+              bundle,
+              stockRows,
+            );
+
+          bundleProducts.push({
+            id: bundleId,
+
+            name:
+              bundle.name ||
+              "Комплект без названия",
+
+            code: bundle.code || "",
+
+            article: bundle.article || "",
+
+            price,
+
+            buyPrice,
+
+            costPrice: buyPrice,
+
+            stock,
+
+            reserve: 0,
+
+            inTransit: 0,
+
+            meta: bundle.meta,
+
+            uom:
+              bundle.uom?.name || "шт",
+
+            pathName:
+              bundle.productFolder?.name ||
+              bundle.folder?.name ||
+              "Общая категория",
+
+            description:
+              bundle.description || "",
+
+            type: "bundle",
+
+            isBundle: true,
+          });
+        } catch (error) {
+          console.error(
+            `Ошибка обработки комплекта "${bundle.name}":`,
+            error.message,
+          );
+        }
+      }
+
+      /*
+       * =================================================
+       * 5. ОБЪЕДИНЯЕМ
+       * =================================================
+       */
+
+      const allProducts = [
+        ...products,
+        ...bundleProducts,
+      ];
+
+      /*
+       * =================================================
+       * ВАЖНО:
+       * НЕ СОХРАНЯЕМ ПУСТОЙ РЕЗУЛЬТАТ
+       * =================================================
+       */
+
+      if (
+        allProducts.length === 0
+      ) {
+        throw new Error(
+          "МойСклад вернул пустой список товаров",
+        );
+      }
+
+      const result = {
+        storeId,
+
+        storeName:
+          "Молодая Гвардия 41",
+
+        total:
+          allProducts.length,
+
+        productsCount:
+          products.length,
+
+        bundlesCount:
+          bundleProducts.length,
+
+        rows:
+          allProducts,
       };
-    });
 
-    // =====================================================
-    // 5. ОБЪЕДИНЯЕМ ТОВАРЫ И КОМПЛЕКТЫ
-    // =====================================================
+      /*
+       * =================================================
+       * СОХРАНЯЕМ В КЭШ
+       * =================================================
+       */
 
-    const allProducts = [
-      ...products,
-      ...bundleProducts,
-    ];
+      productsCache.set(storeId, {
+        timestamp: Date.now(),
+
+        data: result,
+      });
+
+      console.log("================================");
+      console.log("PRODUCTS CACHE ОБНОВЛЁН");
+      console.log("Store:", storeId);
+      console.log(
+        "Товаров:",
+        allProducts.length,
+      );
+      console.log("================================");
+
+      return result;
+    } catch (error) {
+      /*
+       * =================================================
+       * ЕСЛИ МОЙСКЛАД ДАЛ 429 / ОШИБКУ
+       * =================================================
+       *
+       * Старый cache НЕ ТРОГАЕМ.
+       */
+
+      console.error(
+        "Ошибка обновления products:",
+        error.message,
+      );
+
+      throw error;
+    } finally {
+      productsLoading.delete(storeId);
+    }
+  })();
+
+  /*
+   * Запоминаем текущий Promise.
+   *
+   * Если frontend сделает 5 запросов подряд,
+   * все будут ждать ОДИН запрос.
+   */
+
+  productsLoading.set(
+    storeId,
+    loadingPromise,
+  );
+
+  return loadingPromise;
+}
+
+async function forceRefreshProductsCache(storeId = YOUNG_GUARD_ID) {
+  console.log(`🔄 Принудительное обновление товаров: ${storeId}`);
+
+  try {
+    const data = await refreshProductsCache(storeId);
 
     console.log(
-      `Итого товаров: ${products.length}, комплектов: ${bundleProducts.length}`,
+      `✅ Кеш товаров обновлён: ${data?.rows?.length || 0} товаров`,
     );
 
+    return {
+      success: true,
+      data,
+      cached: false,
+      cacheAge: 0,
+    };
+  } catch (error) {
+    console.error(
+      `❌ Ошибка принудительного обновления кеша:`,
+      error.message,
+    );
+
+    throw error;
+  }
+}
+
+app.get("/api/moysklad/products", async (req, res) => {
+  const storeId = req.query.storeId || YOUNG_GUARD_ID;
+
+  const cached = productsCache.get(storeId);
+
+  /*
+   * =====================================================
+   * ЕСЛИ ЕСТЬ КЭШ
+   * =====================================================
+   */
+
+  if (cached) {
+    const cacheAge = Date.now() - cached.timestamp;
+
+    console.log(
+      `PRODUCT CACHE: ${storeId}, возраст ${Math.round(
+        cacheAge / 1000,
+      )} сек`,
+    );
+
+    /*
+     * Сразу отдаём старые данные.
+     * НИКОГДА не показываем белый экран.
+     */
+
+    res.json({
+      ...cached.data,
+
+      cached: true,
+
+      cacheAge,
+    });
+
+    /*
+     * Если кэш свежий —
+     * обновление вообще не нужно.
+     */
+
+    if (cacheAge < PRODUCTS_CACHE_TTL) {
+      return;
+    }
+
+    /*
+     * Кэш устарел.
+     *
+     * Ответ уже отправили.
+     * Теперь обновляем в фоне.
+     */
+
+    refreshProductsCache(storeId).catch((error) => {
+      console.error(
+        `Ошибка фонового обновления товаров ${storeId}:`,
+        error.message,
+      );
+    });
+
+    return;
+  }
+
+  /*
+   * =====================================================
+   * КЭША НЕТ
+   * =====================================================
+   */
+
+  try {
+    const data = await refreshProductsCache(storeId);
+
     return res.json({
-      storeId,
+      ...data,
 
-      storeName: "Молодая Гвардия 41",
+      cached: false,
 
-      total: allProducts.length,
-
-      productsCount: products.length,
-
-      bundlesCount: bundleProducts.length,
-
-      rows: allProducts,
+      cacheAge: 0,
     });
   } catch (error) {
-    console.error("Ошибка получения товаров:", error);
+    console.error(
+      "Ошибка первого получения товаров:",
+      error,
+    );
 
     return res.status(500).json({
+      success: false,
+
       message:
         error.message ||
         "Ошибка получения товаров МойСклад",
+    });
+  }
+});
+
+app.post("/api/moysklad/products/refresh", async (req, res) => {
+  const storeId = req.body?.storeId || YOUNG_GUARD_ID;
+
+  try {
+    const result = await forceRefreshProductsCache(storeId);
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Ошибка принудительного обновления товаров",
     });
   }
 });

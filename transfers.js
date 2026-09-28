@@ -487,7 +487,269 @@ router.post("/outgoing", async (req, res) => {
  * ----------------------------------------------------
  */
 
+/**
+ * ----------------------------------------------------
+ * Раскрытие комплекта
+ * ----------------------------------------------------
+ *
+ * Supply не принимает bundle напрямую.
+ * Поэтому получаем состав комплекта и
+ * превращаем его в обычные позиции.
+ */
+/**
+ * ----------------------------------------------------
+ * Раскрытие комплекта для Supply
+ * ----------------------------------------------------
+ *
+ * ВАЖНО:
+ * МойСклад НЕ разрешает:
+ *
+ * supply.positions.rows[].assortment.type === "bundle"
+ *
+ * Поэтому комплект полностью раскрываем
+ * в его компоненты.
+ */
+async function expandBundle(item) {
+  if (!item.assortmentId) {
+    throw new Error(
+      `У товара "${item.name}" отсутствует assortmentId`,
+    );
+  }
+
+  const quantity = Number(item.quantity);
+
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error(
+      `Некорректное количество товара "${item.name}"`,
+    );
+  }
+
+  /**
+   * Тип ассортимента уже приходит с фронта.
+   *
+   * product.meta:
+   * {
+   *   href: ".../entity/product/...",
+   *   type: "product"
+   * }
+   *
+   * bundle.meta:
+   * {
+   *   href: ".../entity/bundle/...",
+   *   type: "bundle"
+   * }
+   */
+
+  const assortmentMeta = item.assortmentMeta;
+
+  if (!assortmentMeta) {
+    throw new Error(
+      `У товара "${item.name}" отсутствует assortmentMeta`,
+    );
+  }
+
+  const assortmentType =
+    assortmentMeta.type ||
+    assortmentMeta.meta?.type;
+
+  console.log(
+    `Товар "${item.name}" -> тип: ${assortmentType}`,
+  );
+
+  /**
+   * --------------------------------------------------
+   * Обычный товар / модификация
+   * --------------------------------------------------
+   */
+
+  if (assortmentType !== "bundle") {
+    return [
+      {
+        quantity,
+
+        price: Math.round(
+          Number(item.price || 0) * 100,
+        ),
+
+        assortment: {
+          meta: assortmentMeta,
+        },
+      },
+    ];
+  }
+
+  /**
+   * --------------------------------------------------
+   * Это комплект
+   * --------------------------------------------------
+   */
+
+  const bundleId =
+    assortmentMeta.href
+      ?.split("/")
+      .filter(Boolean)
+      .pop();
+
+  if (!bundleId) {
+    throw new Error(
+      `Не удалось определить ID комплекта "${item.name}"`,
+    );
+  }
+
+  console.log(
+    `Получаем комплект ${bundleId} из МойСклад`,
+  );
+
+  /**
+   * Получаем комплект правильным endpoint:
+   *
+   * /entity/bundle/{id}
+   */
+
+const bundle = await moyskladRequest(
+  `/entity/bundle/${bundleId}`,
+);
+
+if (!bundle?.id) {
+  throw new Error(
+    `Комплект "${item.name}" не найден в МойСклад`,
+  );
+}
+
+/**
+ * Компоненты комплекта получаем
+ * отдельным endpoint.
+ */
+const componentsData = await moyskladRequest(
+  `/entity/bundle/${bundleId}/components?limit=100`,
+);
+
+const components =
+  componentsData?.rows || [];
+
+console.log(
+  `КОМПОНЕНТЫ КОМПЛЕКТА "${item.name}":`,
+  JSON.stringify(components, null, 2),
+);
+
+if (components.length === 0) {
+  throw new Error(
+    `Комплект "${item.name}" не содержит компонентов`,
+  );
+}
+
+  if (components.length === 0) {
+    throw new Error(
+      `Комплект "${item.name}" не содержит компонентов`,
+    );
+  }
+
+  /**
+   * Цена всего комплекта.
+   */
+
+  const bundlePrice =
+    Number(item.price || 0);
+
+  /**
+   * Общее количество частей.
+   */
+
+  const totalParts =
+    components.reduce(
+      (sum, component) =>
+        sum + Number(component.quantity || 0),
+      0,
+    );
+
+  const result = [];
+
+  /**
+   * --------------------------------------------------
+   * Раскрываем комплект
+   * --------------------------------------------------
+   */
+
+  for (const component of components) {
+    const componentQuantity =
+      Number(component.quantity || 0);
+
+    if (
+      !Number.isFinite(componentQuantity) ||
+      componentQuantity <= 0
+    ) {
+      continue;
+    }
+
+    const componentMeta =
+      component.assortment?.meta;
+
+    if (!componentMeta) {
+      throw new Error(
+        `У компонента комплекта "${item.name}" отсутствует assortment.meta`,
+      );
+    }
+
+    /**
+     * Вложенный комплект пока запрещаем.
+     */
+
+    if (componentMeta.type === "bundle") {
+      throw new Error(
+        `Комплект "${item.name}" содержит вложенный комплект. Такой комплект нужно обработать отдельно.`,
+      );
+    }
+
+    /**
+     * Количество компонента:
+     *
+     * компонент × количество комплектов
+     */
+
+    const finalQuantity =
+      componentQuantity * quantity;
+
+    /**
+     * Распределяем стоимость комплекта
+     * между компонентами.
+     */
+
+    const componentPrice =
+      totalParts > 0
+        ? bundlePrice *
+          (componentQuantity / totalParts)
+        : 0;
+
+    result.push({
+      quantity: finalQuantity,
+
+      price: Math.round(
+        componentPrice * 100,
+      ),
+
+      assortment: {
+        meta: componentMeta,
+      },
+    });
+  }
+
+  if (result.length === 0) {
+    throw new Error(
+      `Комплект "${item.name}" не удалось раскрыть`,
+    );
+  }
+
+  console.log(
+    `Комплект "${item.name}" раскрыт:`,
+    JSON.stringify(result, null, 2),
+  );
+
+  return result;
+}
+
 router.post("/receipt", async (req, res) => {
+
+
   try {
     const { storeId, supplierId, items, totalAmount, paymentMethod } = req.body;
 
@@ -558,33 +820,20 @@ router.post("/receipt", async (req, res) => {
      * ---------------------------------------------
      */
 
-    const positions = [];
+const positions = [];
 
-    for (const item of items) {
-      if (!item.assortmentId) {
-        throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
-      }
+for (const item of items) {
+  const expandedPositions =
+    await expandBundle(item);
 
-      const quantity = Number(item.quantity);
+  positions.push(...expandedPositions);
+}
 
-      if (!Number.isFinite(quantity) || quantity <= 0) {
-        throw new Error(`Некорректное количество товара "${item.name}"`);
-      }
-
-      const priceSom = Number(item.price || 0);
-
-      const priceKopecks = Math.round(priceSom * 100);
-
-      positions.push({
-        quantity,
-
-        price: priceKopecks,
-
-        assortment: {
-          meta: item.assortmentMeta,
-        },
-      });
-    }
+if (positions.length === 0) {
+  throw new Error(
+    "После обработки товаров не осталось позиций",
+  );
+}
 
     /**
      * ---------------------------------------------
