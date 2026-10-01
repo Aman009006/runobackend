@@ -9,7 +9,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: "https://runo-rouge.vercel.app",
+    origin: "http://localhost:3000",
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -1043,13 +1043,36 @@ async function getBundleComponents(bundleId) {
 
   return components;
 }
-async function refreshProductsCache(storeId) {
-  /*
-   * =====================================================
-   * ЕСЛИ ОБНОВЛЕНИЕ УЖЕ ИДЁТ
-   * =====================================================
-   */
 
+async function getAllMoySkladRows(path, pageSize = 1000) {
+  const allRows = [];
+  let offset = 0;
+
+  while (true) {
+    const separator = path.includes("?") ? "&" : "?";
+
+    const data = await moySkladRequest(
+      `${path}${separator}limit=${pageSize}&offset=${offset}`,
+    );
+
+    const rows = data?.rows || [];
+
+    allRows.push(...rows);
+
+    console.log(
+      `MOYSKLAD: ${path} offset=${offset}, получено=${rows.length}, всего=${allRows.length}`,
+    );
+
+    if (rows.length < pageSize) {
+      break;
+    }
+
+    offset += pageSize;
+  }
+
+  return allRows;
+}
+async function refreshProductsCache(storeId) {
   if (productsLoading.has(storeId)) {
     console.log(
       `PRODUCTS: обновление уже выполняется для ${storeId}`,
@@ -1057,12 +1080,6 @@ async function refreshProductsCache(storeId) {
 
     return productsLoading.get(storeId);
   }
-
-  /*
-   * =====================================================
-   * СОЗДАЁМ PROMISE ОБНОВЛЕНИЯ
-   * =====================================================
-   */
 
   const loadingPromise = (async () => {
     try {
@@ -1080,31 +1097,59 @@ async function refreshProductsCache(storeId) {
 
       /*
        * =================================================
-       * 1. ОСТАТКИ
+       * 1. ОСТАТКИ ПО СКЛАДУ
        * =================================================
+       *
+       * Здесь получаем остатки отдельно.
+       * Отсутствие позиции здесь НЕ означает,
+       * что товара нет в каталоге.
        */
 
-      const stockData = await moySkladRequest(
-        `/report/stock/all?filter=${filterParam}&limit=1000`,
+      const stockRows = await getAllMoySkladRows(
+        `/report/stock/all?filter=${filterParam}`,
       );
 
-      const stockRows = stockData?.rows || [];
-
       console.log(
-        `Получено товаров со склада: ${stockRows.length}`,
+        `Получено позиций с остатками: ${stockRows.length}`,
       );
 
       /*
        * =================================================
-       * 2. КОМПЛЕКТЫ
+       * 2. ВСЕ ОБЫЧНЫЕ ТОВАРЫ
        * =================================================
        */
 
-      const bundleData = await moySkladRequest(
-        `/entity/bundle?limit=1000`,
+      const productRows = await getAllMoySkladRows(
+        `/entity/product`,
       );
 
-      const bundles = bundleData?.rows || [];
+      console.log(
+        `Получено обычных товаров: ${productRows.length}`,
+      );
+
+      /*
+       * =================================================
+       * 3. ВСЕ МОДИФИКАЦИИ
+       * =================================================
+       */
+
+      const variantRows = await getAllMoySkladRows(
+        `/entity/variant`,
+      );
+
+      console.log(
+        `Получено модификаций: ${variantRows.length}`,
+      );
+
+      /*
+       * =================================================
+       * 4. ВСЕ КОМПЛЕКТЫ
+       * =================================================
+       */
+
+      const bundles = await getAllMoySkladRows(
+        `/entity/bundle`,
+      );
 
       console.log(
         `Получено комплектов: ${bundles.length}`,
@@ -1112,78 +1157,309 @@ async function refreshProductsCache(storeId) {
 
       /*
        * =================================================
-       * 3. ОБЫЧНЫЕ ТОВАРЫ
+       * 5. СОЗДАЁМ MAP ОСТАТКОВ
        * =================================================
+       *
+       * Чтобы не делать stockRows.find()
+       * для каждого товара.
        */
 
-      const products = stockRows.map((item) => {
+      const stockMap = new Map();
+
+      for (const item of stockRows) {
         const rawHref = item.meta?.href || "";
 
         const cleanHref = rawHref.split("?")[0];
 
-        const productId =
+        const id =
           cleanHref.split("/").pop() || "";
 
-        const price = item.salePrice
-          ? item.salePrice / 100
-          : 0;
+        if (!id) {
+          continue;
+        }
 
-        const buyPrice = item.price
-          ? item.price / 100
-          : 0;
+        const type =
+          item.meta?.type || "product";
 
-        const costPrice = item.price
-          ? item.price / 100
-          : 0;
+        stockMap.set(
+          `${type}:${id}`,
+          item,
+        );
+      }
+
+      /*
+       * =================================================
+       * 6. ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ
+       * =================================================
+       */
+
+      function getSalePrice(item, stockItem) {
+        /*
+         * Для stock report
+         */
+
+        if (
+          stockItem?.salePrice != null
+        ) {
+          return Number(
+            stockItem.salePrice,
+          ) / 100;
+        }
+
+        /*
+         * Для product / variant
+         */
+
+        if (
+          item.salePrices?.[0]?.value != null
+        ) {
+          return Number(
+            item.salePrices[0].value,
+          ) / 100;
+        }
+
+        if (
+          item.salePrice?.value != null
+        ) {
+          return Number(
+            item.salePrice.value,
+          ) / 100;
+        }
+
+        return 0;
+      }
+
+      /*
+       * =================================================
+       * 7. ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ ЗАКУПКИ
+       * =================================================
+       */
+
+      function getBuyPrice(item, stockItem) {
+        /*
+         * В stock report цена закупки
+         */
+
+        if (
+          stockItem?.price != null
+        ) {
+          return Number(
+            stockItem.price,
+          ) / 100;
+        }
+
+        /*
+         * В product / variant buyPrice
+         * может быть числом
+         */
+
+        if (
+          typeof item.buyPrice === "number"
+        ) {
+          return Number(
+            item.buyPrice,
+          ) / 100;
+        }
+
+        /*
+         * Или объектом { value: ... }
+         */
+
+        if (
+          item.buyPrice?.value != null
+        ) {
+          return Number(
+            item.buyPrice.value,
+          ) / 100;
+        }
+
+        return 0;
+      }
+
+      /*
+       * =================================================
+       * 8. ФУНКЦИЯ ПОЛУЧЕНИЯ ID
+       * =================================================
+       */
+
+      function getEntityId(item) {
+        const rawHref =
+          item.meta?.href || "";
+
+        const cleanHref =
+          rawHref.split("?")[0];
+
+        return (
+          cleanHref.split("/").pop() ||
+          item.id ||
+          ""
+        );
+      }
+
+      /*
+       * =================================================
+       * 9. ПРЕОБРАЗОВАНИЕ PRODUCT / VARIANT
+       * =================================================
+       */
+
+      function normalizeCatalogItem(
+        item,
+        type,
+      ) {
+        const id =
+          getEntityId(item);
+
+        const stockItem =
+          stockMap.get(
+            `${type}:${id}`,
+          );
+
+        const price =
+          getSalePrice(
+            item,
+            stockItem,
+          );
+
+        const buyPrice =
+          getBuyPrice(
+            item,
+            stockItem,
+          );
+
+        /*
+         * Если позиции нет в stock report,
+         * она всё равно должна существовать.
+         *
+         * Просто остаток будет 0.
+         */
+
+        const stock =
+          stockItem
+            ? Number(
+                stockItem.stock || 0,
+              )
+            : 0;
+
+        const reserve =
+          stockItem
+            ? Number(
+                stockItem.reserve || 0,
+              )
+            : 0;
+
+        const inTransit =
+          stockItem
+            ? Number(
+                stockItem.inTransit || 0,
+              )
+            : 0;
+
+        const reserveStock =
+          stockItem
+            ? Number(
+                stockItem.reserveStock || 0,
+              )
+            : 0;
 
         return {
-          id: productId,
+          id,
 
-          name: item.name || "Товар без названия",
+          name:
+            item.name ||
+            (
+              type === "variant"
+                ? "Модификация без названия"
+                : "Товар без названия"
+            ),
 
-          code: item.code || "",
+          code:
+            item.code || "",
 
-          article: item.article || "",
+          article:
+            item.article || "",
 
           price,
 
           buyPrice,
 
-          costPrice,
+          costPrice:
+            buyPrice,
 
-          stock: Number(item.stock || 0),
+          stock,
 
-          reserve: Number(item.reserve || 0),
+          reserve,
 
-          inTransit: Number(item.inTransit || 0),
+          inTransit,
 
-          reserveStock: Number(
-            item.reserveStock || 0,
-          ),
+          reserveStock,
 
-          meta: item.meta,
+          meta:
+            item.meta,
 
           uom:
-            item.uom?.name || "шт",
+            item.uom?.name ||
+            stockItem?.uom?.name ||
+            "шт",
 
           pathName:
-            item.folder?.name ||
             item.productFolder?.name ||
+            item.folder?.name ||
+            stockItem?.folder?.name ||
+            stockItem?.productFolder?.name ||
             "Общая категория",
 
           description:
-            item.description || "",
+            item.description ||
+            "",
 
-          type:
-            item.meta?.type || "product",
+          type,
 
-          isBundle: false,
+          isBundle:
+            false,
+
+          /*
+           * Дополнительно сохраняем,
+           * что это именно модификация.
+           */
+
+          isVariant:
+            type === "variant",
         };
-      });
+      }
 
       /*
        * =================================================
-       * 4. КОМПЛЕКТЫ
+       * 10. ОБЫЧНЫЕ ТОВАРЫ
+       * =================================================
+       */
+
+      const products =
+        productRows.map(
+          (item) =>
+            normalizeCatalogItem(
+              item,
+              "product",
+            ),
+        );
+
+      /*
+       * =================================================
+       * 11. МОДИФИКАЦИИ
+       * =================================================
+       */
+
+      const variants =
+        variantRows.map(
+          (item) =>
+            normalizeCatalogItem(
+              item,
+              "variant",
+            ),
+        );
+
+      /*
+       * =================================================
+       * 12. КОМПЛЕКТЫ
        * =================================================
        */
 
@@ -1191,24 +1467,26 @@ async function refreshProductsCache(storeId) {
 
       for (const bundle of bundles) {
         try {
-          const rawHref =
-            bundle.meta?.href || "";
-
-          const cleanHref =
-            rawHref.split("?")[0];
-
           const bundleId =
-            cleanHref.split("/").pop() || "";
+            getEntityId(bundle);
 
           const price =
             bundle.salePrices?.[0]?.value != null
-              ? bundle.salePrices[0].value / 100
+              ? Number(
+                  bundle.salePrices[0].value,
+                ) / 100
               : 0;
 
           const buyPrice =
-            bundle.buyPrice != null
-              ? bundle.buyPrice / 100
-              : 0;
+            bundle.buyPrice?.value != null
+              ? Number(
+                  bundle.buyPrice.value,
+                ) / 100
+              : typeof bundle.buyPrice === "number"
+                ? Number(
+                    bundle.buyPrice,
+                  ) / 100
+                : 0;
 
           const stock =
             await calculateBundleStock(
@@ -1217,21 +1495,27 @@ async function refreshProductsCache(storeId) {
             );
 
           bundleProducts.push({
-            id: bundleId,
+            id:
+              bundleId,
 
             name:
               bundle.name ||
               "Комплект без названия",
 
-            code: bundle.code || "",
+            code:
+              bundle.code ||
+              "",
 
-            article: bundle.article || "",
+            article:
+              bundle.article ||
+              "",
 
             price,
 
             buyPrice,
 
-            costPrice: buyPrice,
+            costPrice:
+              buyPrice,
 
             stock,
 
@@ -1239,10 +1523,14 @@ async function refreshProductsCache(storeId) {
 
             inTransit: 0,
 
-            meta: bundle.meta,
+            reserveStock: 0,
+
+            meta:
+              bundle.meta,
 
             uom:
-              bundle.uom?.name || "шт",
+              bundle.uom?.name ||
+              "шт",
 
             pathName:
               bundle.productFolder?.name ||
@@ -1250,11 +1538,17 @@ async function refreshProductsCache(storeId) {
               "Общая категория",
 
             description:
-              bundle.description || "",
+              bundle.description ||
+              "",
 
-            type: "bundle",
+            type:
+              "bundle",
 
-            isBundle: true,
+            isBundle:
+              true,
+
+            isVariant:
+              false,
           });
         } catch (error) {
           console.error(
@@ -1266,19 +1560,19 @@ async function refreshProductsCache(storeId) {
 
       /*
        * =================================================
-       * 5. ОБЪЕДИНЯЕМ
+       * 13. ОБЪЕДИНЯЕМ ВСЁ
        * =================================================
        */
 
       const allProducts = [
         ...products,
+        ...variants,
         ...bundleProducts,
       ];
 
       /*
        * =================================================
-       * ВАЖНО:
-       * НЕ СОХРАНЯЕМ ПУСТОЙ РЕЗУЛЬТАТ
+       * 14. ПРОВЕРКА
        * =================================================
        */
 
@@ -1289,6 +1583,12 @@ async function refreshProductsCache(storeId) {
           "МойСклад вернул пустой список товаров",
         );
       }
+
+      /*
+       * =================================================
+       * 15. РЕЗУЛЬТАТ
+       * =================================================
+       */
 
       const result = {
         storeId,
@@ -1302,6 +1602,9 @@ async function refreshProductsCache(storeId) {
         productsCount:
           products.length,
 
+        variantsCount:
+          variants.length,
+
         bundlesCount:
           bundleProducts.length,
 
@@ -1311,35 +1614,43 @@ async function refreshProductsCache(storeId) {
 
       /*
        * =================================================
-       * СОХРАНЯЕМ В КЭШ
+       * 16. СОХРАНЯЕМ В КЭШ
        * =================================================
        */
 
-      productsCache.set(storeId, {
-        timestamp: Date.now(),
+      productsCache.set(
+        storeId,
+        {
+          timestamp:
+            Date.now(),
 
-        data: result,
-      });
+          data:
+            result,
+        },
+      );
 
       console.log("================================");
       console.log("PRODUCTS CACHE ОБНОВЛЁН");
-      console.log("Store:", storeId);
       console.log(
-        "Товаров:",
+        "Обычных товаров:",
+        products.length,
+      );
+      console.log(
+        "Модификаций:",
+        variants.length,
+      );
+      console.log(
+        "Комплектов:",
+        bundleProducts.length,
+      );
+      console.log(
+        "Всего:",
         allProducts.length,
       );
       console.log("================================");
 
       return result;
     } catch (error) {
-      /*
-       * =================================================
-       * ЕСЛИ МОЙСКЛАД ДАЛ 429 / ОШИБКУ
-       * =================================================
-       *
-       * Старый cache НЕ ТРОГАЕМ.
-       */
-
       console.error(
         "Ошибка обновления products:",
         error.message,
@@ -1347,16 +1658,11 @@ async function refreshProductsCache(storeId) {
 
       throw error;
     } finally {
-      productsLoading.delete(storeId);
+      productsLoading.delete(
+        storeId,
+      );
     }
   })();
-
-  /*
-   * Запоминаем текущий Promise.
-   *
-   * Если frontend сделает 5 запросов подряд,
-   * все будут ждать ОДИН запрос.
-   */
 
   productsLoading.set(
     storeId,
