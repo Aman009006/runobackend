@@ -5,7 +5,13 @@ const path = require("path");
 const router = express.Router();
 
 const DATA_DIR = path.join(__dirname, "..", "data");
-
+const multer = require("multer");
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 20 * 1024 * 1024,
+  },
+});
 /*
 |--------------------------------------------------------------------------
 | HELPERS
@@ -1106,7 +1112,109 @@ const paymentTotalFromSales =
     });
   }
 });
+/*
+|--------------------------------------------------------------------------
+| ROUTE: SEND REPORT TO TELEGRAM
+|--------------------------------------------------------------------------
+| POST /api/reports/send-telegram
+|--------------------------------------------------------------------------
+*/
 
+router.post(
+  "/send-telegram",
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      const chatId = process.env.TELEGRAM_CHAT_ID;
+
+      if (!botToken) {
+        return res.status(500).json({
+          success: false,
+          message: "TELEGRAM_BOT_TOKEN не настроен",
+        });
+      }
+
+      if (!chatId) {
+        return res.status(500).json({
+          success: false,
+          message: "TELEGRAM_CHAT_ID не настроен",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "PDF-файл не передан",
+        });
+      }
+
+      const caption =
+        req.body?.caption ||
+        `Отчёт кассы\n${new Date().toLocaleString("ru-RU")}`;
+
+      const formData = new FormData();
+
+      formData.append("chat_id", chatId);
+      formData.append("caption", caption);
+
+      const blob = new Blob(
+        [req.file.buffer],
+        {
+          type: req.file.mimetype || "application/pdf",
+        },
+      );
+
+      formData.append(
+        "document",
+        blob,
+        req.file.originalname || "report.pdf",
+      );
+
+      const telegramResponse = await fetch(
+        `https://api.telegram.org/bot${botToken}/sendDocument`,
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
+
+      const telegramData =
+        await telegramResponse.json();
+
+      if (!telegramResponse.ok || !telegramData.ok) {
+        console.error(
+          "TELEGRAM ERROR:",
+          telegramData,
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            telegramData.description ||
+            "Telegram не принял файл",
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "Отчёт отправлен в Telegram",
+      });
+    } catch (error) {
+      console.error(
+        "SEND TELEGRAM REPORT ERROR:",
+        error,
+      );
+
+      res.status(500).json({
+        success: false,
+        message:
+          "Не удалось отправить отчёт в Telegram",
+        error: error.message,
+      });
+    }
+  },
+);
 /*
 |--------------------------------------------------------------------------
 | ROUTE: CLEAR ALL DATA

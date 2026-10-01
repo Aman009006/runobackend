@@ -2406,6 +2406,110 @@ const noCashSum =
   }
 });
 
+// =========================================================
+// UPDATE SALESPERSON IN LOCAL SALE
+// =========================================================
+
+app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
+  try {
+    const { saleId } = req.params;
+    const { salespersonId } = req.body;
+
+    if (!saleId) {
+      return res.status(400).json({
+        success: false,
+        message: "Не указан ID продажи",
+      });
+    }
+
+    if (!salespersonId) {
+      return res.status(400).json({
+        success: false,
+        message: "Не указан продавец",
+      });
+    }
+
+    const salesperson = SALESPERSONS.find(
+      (item) => item.id === salespersonId,
+    );
+
+    if (!salesperson) {
+      return res.status(404).json({
+        success: false,
+        message: "Продавец не найден",
+      });
+    }
+
+    const salesByDate = readSales();
+
+    let found = false;
+    let updatedSale = null;
+
+    for (const date of Object.keys(salesByDate)) {
+      const sales = salesByDate[date];
+
+      if (!Array.isArray(sales)) {
+        continue;
+      }
+
+      const saleIndex = sales.findIndex(
+        (sale) => sale?.id === saleId,
+      );
+
+      if (saleIndex === -1) {
+        continue;
+      }
+
+      sales[saleIndex] = {
+        ...sales[saleIndex],
+
+        salesperson: {
+          id: salesperson.id,
+          name: salesperson.name,
+        },
+      };
+
+      updatedSale = sales[saleIndex];
+      found = true;
+
+      break;
+    }
+
+    if (!found) {
+      return res.status(404).json({
+        success: false,
+        message: "Продажа не найдена",
+      });
+    }
+
+    writeSales(salesByDate);
+
+    console.log("================================");
+    console.log("ПРОДАВЕЦ ПРОДАЖИ ИЗМЕНЁН");
+    console.log("Продажа:", saleId);
+    console.log("Продавец:", salesperson.name);
+    console.log("ID продавца:", salesperson.id);
+    console.log("================================");
+
+    return res.json({
+      success: true,
+      sale: updatedSale,
+    });
+  } catch (error) {
+    console.error(
+      "Ошибка изменения продавца продажи:",
+      error,
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        error.message ||
+        "Не удалось изменить продавца",
+    });
+  }
+});
+
 /* =========================================================
    START
 ========================================================= */
