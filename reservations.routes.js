@@ -17,7 +17,91 @@ const PAYMENT_KEYS = [
   "mplus",
   "online_qr",
 ];
+const PORT = process.env.PORT || 5000;
 
+const AGENT = process.env.MOYSKLAD_AGENT;
+
+const LOGIN = process.env.MOYSKLAD_LOGIN;
+const PASSWORD = process.env.MOYSKLAD_PASSWORD;
+
+const RETAIL_STORE_ID = process.env.MOYSKLAD_RETAIL_STORE_ID;
+
+const MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2";
+
+const MOYSKLAD_POS_API = "https://online.moysklad.ru/api/posap/1.0";
+
+const YOUNG_GUARD_ID =
+  "40b43662-2117-11f1-0a80-1cb200302c3c";
+
+/**
+ * Запрос к API МойСклад
+ */
+async function moySkladRequest(endpoint, options = {}) {
+  const url = endpoint.startsWith("http")
+    ? endpoint
+    : `${MOYSKLAD_API}${endpoint}`;
+
+  const auth = Buffer.from(
+    `${LOGIN}:${PASSWORD}`,
+  ).toString("base64");
+
+  const response = await fetch(url, {
+    ...options,
+
+    headers: {
+      Accept: "application/json;charset=utf-8",
+      Authorization: `Basic ${auth}`,
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await response.text();
+
+  let data;
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {
+      message: text,
+    };
+  }
+
+  if (!response.ok) {
+    console.error(
+      "МойСклад API error:",
+      response.status,
+      data,
+    );
+
+    throw new Error(
+      data?.errors?.[0]?.error ||
+        data?.message ||
+        `Ошибка МойСклад API: ${response.status}`,
+    );
+  }
+
+  return data;
+}
+
+/**
+ * Получаем организацию МойСклад
+ */
+async function getMoySkladOrganization() {
+  const data = await moySkladRequest(
+    "/entity/organization?limit=1",
+  );
+
+  const organization = data.rows?.[0];
+
+  if (!organization) {
+    throw new Error(
+      "В МойСклад не найдена организация",
+    );
+  }
+
+  return organization;
+}
 async function ensureStorage() {
   await fs.mkdir(DATA_DIR, {
     recursive: true,
@@ -232,7 +316,236 @@ function calculatePaymentHistoryTotal(paymentHistory = []) {
 
   return roundMoney(total);
 }
+async function createReservationRetailSale({
+  reservation,
+  retailShiftSyncId,
+}) {
+  if (!retailShiftSyncId) {
+    throw new Error(
+      "Открытая кассовая смена МойСклад не найдена",
+    );
+  }
 
+  const retailStoreId = RETAIL_STORE_ID;
+
+  if (!retailStoreId) {
+    throw new Error(
+      "MOYSKLAD_RETAIL_STORE_ID не указан в .env",
+    );
+  }
+
+  const organization = await getMoySkladOrganization();
+
+  if (!AGENT) {
+    throw new Error(
+      "MOYSKLAD_AGENT не указан в .env",
+    );
+  }
+
+  const payments = normalizePayments(
+    reservation.payments,
+  );
+
+  const total = roundMoney(
+    reservation.total,
+  );
+
+  const normalizedTotal = Math.round(
+    total * 100,
+  );
+
+  const cashSum = Math.round(
+    payments.cash * 100,
+  );
+
+  const noCashSum = Math.round(
+    (
+      payments.card +
+      payments.amanat +
+      payments.mplus +
+      payments.online_qr
+    ) * 100,
+  );
+
+  const paidTotal = cashSum + noCashSum;
+
+  if (paidTotal !== normalizedTotal) {
+    throw new Error(
+      `Ошибка оплаты брони. Сумма оплаты ${paidTotal / 100} сом, сумма брони ${normalizedTotal / 100} сом`,
+    );
+  }
+
+  const shiftFilter = encodeURIComponent(
+    `syncId=${retailShiftSyncId}`,
+  );
+
+  const shiftData = await moySkladRequest(
+    `/entity/retailshift?filter=${shiftFilter}&limit=1`,
+  );
+
+  const retailShift = shiftData.rows?.[0];
+
+  if (!retailShift) {
+    throw new Error(
+      `Розничная смена с syncId ${retailShiftSyncId} не найдена`,
+    );
+  }
+
+  const positions = reservation.items.map(
+    (item) => {
+      if (!item.id) {
+        throw new Error(
+          `У товара "${item.name}" отсутствует ID МойСклад`,
+        );
+      }
+
+      const quantity = Number(
+        item.quantity,
+      );
+
+      if (
+        !Number.isFinite(quantity) ||
+        quantity <= 0
+      ) {
+        throw new Error(
+          `Некорректное количество товара "${item.name}"`,
+        );
+      }
+
+      const price = Math.round(
+        Number(item.price) * 100,
+      );
+
+      if (
+        !Number.isFinite(price) ||
+        price < 0
+      ) {
+        throw new Error(
+          `Некорректная цена товара "${item.name}"`,
+        );
+      }
+
+      const type =
+        item.type || "product";
+
+      return {
+        quantity,
+
+        price,
+
+        assortment: {
+          meta: {
+            href: `${MOYSKLAD_API}/entity/${type}/${item.id}`,
+
+            type,
+
+            mediaType:
+              "application/json",
+          },
+        },
+      };
+    },
+  );
+
+  const orderId =
+    `RES-${reservation.id}`;
+
+  const paymentComment = [
+    `Бронь: ${reservation.id}`,
+    `Клиент: ${reservation.customerName || "Не указан"}`,
+    `Телефон: ${reservation.customerPhone || "Не указан"}`,
+    `Наличные: ${(cashSum / 100).toFixed(2)} сом`,
+    `Карта: ${(payments.card).toFixed(2)} сом`,
+    `Аманат: ${(payments.amanat).toFixed(2)} сом`,
+    `М+: ${(payments.mplus).toFixed(2)} сом`,
+    `Онлайн QR: ${(payments.online_qr).toFixed(2)} сом`,
+    `Итого: ${(normalizedTotal / 100).toFixed(2)} сом`,
+  ].join("\n");
+
+  const retailDemandData = {
+    name: orderId,
+
+    description: paymentComment,
+
+    organization: {
+      meta: {
+        href: organization.meta.href,
+        type: "organization",
+        mediaType: "application/json",
+      },
+    },
+
+    agent: {
+      meta: {
+        href: `${MOYSKLAD_API}/entity/counterparty/${AGENT}`,
+        type: "counterparty",
+        mediaType: "application/json",
+      },
+    },
+
+    retailStore: {
+      meta: {
+        href: `${MOYSKLAD_API}/entity/retailstore/${retailStoreId}`,
+        type: "retailstore",
+        mediaType: "application/json",
+      },
+    },
+
+    retailShift: {
+      meta: {
+        href: `${MOYSKLAD_API}/entity/retailshift/${retailShift.id}`,
+        type: "retailshift",
+        mediaType: "application/json",
+      },
+    },
+
+    positions,
+  };
+
+  if (cashSum > 0) {
+    retailDemandData.cashSum =
+      cashSum;
+  }
+
+  if (noCashSum > 0) {
+    retailDemandData.noCashSum =
+      noCashSum;
+  }
+
+  console.log(
+    "Создание розничной продажи по брони:",
+    JSON.stringify(
+      retailDemandData,
+      null,
+      2,
+    ),
+  );
+
+  const retailDemand =
+    await moySkladRequest(
+      "/entity/retaildemand",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+
+        body: JSON.stringify(
+          retailDemandData,
+        ),
+      },
+    );
+
+  return {
+    retailDemand,
+    retailShift,
+    orderId,
+    cashSum,
+    noCashSum,
+  };
+}
 function getPaymentHistoryPaid(paymentHistory = []) {
   if (!Array.isArray(paymentHistory)) {
     return 0;
@@ -1221,6 +1534,9 @@ router.post("/:id/issue", async (req, res) => {
   try {
     const { id } = req.params;
 
+    const { retailShiftSyncId } =
+      req.body;
+
     const reservations =
       await readReservations();
 
@@ -1272,14 +1588,83 @@ router.post("/:id/issue", async (req, res) => {
       });
     }
 
+    if (!retailShiftSyncId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Открытая кассовая смена МойСклад не найдена",
+      });
+    }
+
+    /*
+     * =========================================
+     * СОЗДАЁМ РОЗНИЧНУЮ ПРОДАЖУ В МОЙСКЛАД
+     * =========================================
+     */
+
+    let moyskladResult;
+
+    try {
+      moyskladResult =
+        await createReservationRetailSale({
+          reservation: current,
+          retailShiftSyncId,
+        });
+    } catch (moyskladError) {
+      console.error(
+        "Ошибка создания продажи брони в МойСклад:",
+        moyskladError,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          moyskladError.message ||
+          "Не удалось создать продажу в МойСклад",
+      });
+    }
+
+    /*
+     * =========================================
+     * ТОЛЬКО ПОСЛЕ УСПЕШНОГО МОЙСКЛАД
+     * ПОМЕЧАЕМ БРОНЬ КАК ВЫДАННУЮ
+     * =========================================
+     */
+
     const updatedReservation = {
       ...current,
 
-      status:
-        "issued",
+      status: "issued",
 
-      updatedAt:
-        getNow(),
+      updatedAt: getNow(),
+
+      moyskladSale: {
+        id:
+          moyskladResult
+            .retailDemand?.id ||
+          null,
+
+        href:
+          moyskladResult
+            .retailDemand
+            ?.meta?.href ||
+          null,
+
+        name:
+          moyskladResult
+            .retailDemand?.name ||
+          moyskladResult.orderId,
+
+        retailShiftSyncId,
+
+        retailShiftId:
+          moyskladResult
+            .retailShift?.id ||
+          null,
+
+        createdAt:
+          getNow(),
+      },
     };
 
     reservations[index] =
@@ -1291,8 +1676,27 @@ router.post("/:id/issue", async (req, res) => {
 
     return res.json({
       success: true,
+
       reservation:
         updatedReservation,
+
+      moysklad: {
+        saleId:
+          moyskladResult
+            .retailDemand?.id ||
+          null,
+
+        saleHref:
+          moyskladResult
+            .retailDemand
+            ?.meta?.href ||
+          null,
+
+        retailShiftId:
+          moyskladResult
+            .retailShift?.id ||
+          null,
+      },
     });
   } catch (error) {
     console.error(
