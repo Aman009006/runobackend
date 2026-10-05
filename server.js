@@ -9,7 +9,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: ["http://localhost:3000","https://runo-rouge.vercel.app"],
+    origin: ["http://localhost:3000", "https://runo-rouge.vercel.app"],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -59,7 +59,6 @@ const DATA_DIR = path.join(__dirname, "..", "data");
 const SALES_FILE = path.join(DATA_DIR, "sales.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
 const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
-
 
 // Создаем папку data
 if (!fs.existsSync(DATA_DIR)) {
@@ -112,6 +111,94 @@ function readSales() {
 
 function writeSales(sales) {
   fs.writeFileSync(SALES_FILE, JSON.stringify(sales, null, 2), "utf8");
+}
+
+async function sendTelegramCancellationNotification(sale) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    console.log(
+      "Telegram уведомление пропущено: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны",
+    );
+    return;
+  }
+
+  const cancelledAt = sale.cancelledAt
+    ? new Date(sale.cancelledAt)
+    : new Date();
+
+  const formattedDate = cancelledAt.toLocaleString("ru-RU", {
+    timeZone: "Asia/Bishkek",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+  const totalSom = Number(sale.totalSom ?? Number(sale.total || 0) / 100);
+
+  const formattedTotal = new Intl.NumberFormat("ru-RU", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(totalSom);
+
+  let itemsText = "";
+
+  if (Array.isArray(sale.items) && sale.items.length > 0) {
+    itemsText = sale.items
+      .map((item, index) => {
+        const name = item.name || item.title || item.productName || "Товар";
+
+        const quantity = Number(item.quantity || 0);
+
+        return `${index + 1}. ${name} — ${quantity} шт.`;
+      })
+      .join("\n");
+  } else {
+    itemsText = "Товары не указаны";
+  }
+
+  const salesperson =
+    typeof sale.salesperson === "object"
+      ? sale.salesperson?.name || "Не указан"
+      : sale.salesperson || "Не указан";
+
+  const message =
+    `🔴 <b>ПРОДАЖА ОТМЕНЕНА</b>\n\n` +
+    `🕐 <b>Время:</b> ${formattedDate}\n` +
+    `🧾 <b>Продажа:</b> ${sale.id || "Не указана"}\n` +
+    `👤 <b>Продавец:</b> ${salesperson}\n` +
+    `💰 <b>Сумма:</b> ${formattedTotal} сом\n\n` +
+    `💰 <b>Способ оплаты:</b> ${sale.payment.method || "Не указан"}\n\n` +
+    `📦 <b>Товары:</b>\n` +
+    `${itemsText}\n\n` +
+    `❌ Продажа удалена из МойСклад.`;
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        parse_mode: "HTML",
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(`Telegram ${response.status}: ${errorText}`);
+  }
+
+  console.log("Telegram уведомление об отмене продажи отправлено");
 }
 
 // =========================================================
@@ -170,7 +257,7 @@ function saveSale(sale) {
 // ADD SALE CASH TO CASH.JSON
 // =========================================================
 
-function addSaleToCash(cashSum, salesperson) {
+function addSaleToCash(cashSum, salesperson, orderId = null) {
   try {
     // Если наличной оплаты нет — ничего не делаем
     if (!cashSum || cashSum <= 0) {
@@ -222,6 +309,9 @@ function addSaleToCash(cashSum, salesperson) {
 
       balanceAfter,
 
+      // Связь с продажей
+      orderId: orderId || null,
+
       responsible:
         typeof salesperson === "object"
           ? salesperson.name || "Не указан"
@@ -244,6 +334,7 @@ function addSaleToCash(cashSum, salesperson) {
     console.log("================================");
     console.log("НАЛИЧНАЯ ОПЛАТА ДОБАВЛЕНА В КАССУ");
     console.log("Сумма:", amountSom, "сом");
+    console.log("Order ID:", orderId);
     console.log("Баланс до:", balanceBefore);
     console.log("Баланс после:", balanceAfter);
     console.log("Транзакция:", transaction.id);
@@ -261,14 +352,18 @@ function addSaleToCash(cashSum, salesperson) {
 // ADD RETURN CASH TO CASH.JSON
 // =========================================================
 
-function addReturnToCash(cashSum, orderId, returnId, returnDocumentId) {
+function addReturnToCash(
+  cashSum,
+  orderId,
+  returnId,
+  returnDocumentId,
+  isCancellation = false,
+) {
   try {
-    // Если наличного возврата нет — ничего не делаем
     if (!cashSum || cashSum <= 0) {
       return null;
     }
 
-    // Читаем cash.json
     let cashData = {
       balance: 0,
       transactions: [],
@@ -282,7 +377,6 @@ function addReturnToCash(cashSum, orderId, returnId, returnDocumentId) {
       }
     }
 
-    // Проверяем структуру
     if (!Array.isArray(cashData.transactions)) {
       cashData.transactions = [];
     }
@@ -291,36 +385,21 @@ function addReturnToCash(cashSum, orderId, returnId, returnDocumentId) {
       cashData.balance = 0;
     }
 
-    // cashSum приходит в копейках
-    // cash.json хранит баланс в сомах
     const amountSom = cashSum / 100;
 
-    // Баланс до возврата
     const balanceBefore = cashData.balance;
-
-    // Проверяем, хватает ли денег
-    // if (balanceBefore < amountSom) {
-    //   throw new Error(
-    //     `Недостаточно денег в кассе для возврата. ` +
-    //       `Баланс: ${balanceBefore} сом, ` +
-    //       `требуется: ${amountSom} сом`,
-    //   );
-    // }
-
-    // Новый баланс
     const balanceAfter = balanceBefore - amountSom;
 
-    // Создаём транзакцию
     const transaction = {
-      id: `CASH-RETURN-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+      id: `${
+        isCancellation ? "CASH-CANCELLATION" : "CASH-RETURN"
+      }-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
 
-      type: "return",
+      type: isCancellation ? "cancellation" : "return",
 
-      // Возврат денег — отрицательная сумма
       amount: -amountSom,
 
       balanceBefore,
-
       balanceAfter,
 
       orderId: orderId || null,
@@ -329,35 +408,37 @@ function addReturnToCash(cashSum, orderId, returnId, returnDocumentId) {
 
       returnDocumentId: returnDocumentId || null,
 
-      comment: "Возврат денег за товар",
+      comment: isCancellation ? "Отмена платежа" : "Возврат денег за товар",
 
       createdAt: new Date().toISOString(),
     };
 
-    // Обновляем баланс
     cashData.balance = balanceAfter;
 
-    // Добавляем историю
     cashData.transactions.push(transaction);
 
-    // Сохраняем
     fs.writeFileSync(CASH_FILE, JSON.stringify(cashData, null, 2), "utf8");
 
-    console.log("================================");
-    console.log("ВОЗВРАТ ДЕНЕГ ИЗ КАССЫ");
-    console.log("Сумма:", amountSom, "сом");
-    console.log("Баланс до:", balanceBefore);
-    console.log("Баланс после:", balanceAfter);
-    console.log("Транзакция:", transaction.id);
-    console.log("================================");
+    console.log(
+      isCancellation
+        ? "Отмена платежа записана в кассу:"
+        : "Возврат записан в кассу:",
+      transaction.id,
+    );
 
     return transaction;
   } catch (error) {
-    console.error("Ошибка возврата денег из cash.json:", error);
+    console.error(
+      isCancellation
+        ? "Ошибка записи отмены платежа в кассу:"
+        : "Ошибка записи возврата в кассу:",
+      error,
+    );
 
     throw error;
   }
 }
+
 // =========================================================
 // GET LOCAL SALES
 // =========================================================
@@ -412,8 +493,6 @@ app.get("/api/moysklad/sales", (req, res) => {
 });
 
 app.use("/api/reservations", reservationsRouter);
-
-
 
 let moySkladToken = null;
 let moySkladOrganization = null;
@@ -730,6 +809,46 @@ async function moySkladRequest(path, options = {}) {
   return response.json();
 }
 
+async function deleteMoySkladRetailDemand(id) {
+  if (!moySkladToken) {
+    await authorizeMoySklad();
+  }
+
+  let response = await fetch(`${MOYSKLAD_API}/entity/retaildemand/${id}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json;charset=utf-8",
+      Authorization: `Bearer ${moySkladToken}`,
+    },
+  });
+
+  // Если токен устарел — получаем новый и повторяем DELETE
+  if (response.status === 401) {
+    console.log("Получаем новый токен МойСклад...");
+
+    moySkladToken = null;
+
+    await authorizeMoySklad();
+
+    response = await fetch(`${MOYSKLAD_API}/entity/retaildemand/${id}`, {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json;charset=utf-8",
+        Authorization: `Bearer ${moySkladToken}`,
+      },
+    });
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(`МойСклад ${response.status}: ${errorText}`);
+  }
+
+  // DELETE может вернуть пустой ответ — это нормально
+  return true;
+}
+
 /* =========================================================
    HEALTH
 ========================================================= */
@@ -900,12 +1019,10 @@ async function calculateBundleStock(bundle, stockRows) {
       return 0;
     }
 
-const components = await getBundleComponents(bundleId);
+    const components = await getBundleComponents(bundleId);
 
     if (components.length === 0) {
-      console.log(
-        `Комплект "${bundle.name}" не имеет компонентов`,
-      );
+      console.log(`Комплект "${bundle.name}" не имеет компонентов`);
 
       return 0;
     }
@@ -915,10 +1032,7 @@ const components = await getBundleComponents(bundleId);
     for (const component of components) {
       const componentQuantity = Number(component.quantity || 0);
 
-      if (
-        !Number.isFinite(componentQuantity) ||
-        componentQuantity <= 0
-      ) {
+      if (!Number.isFinite(componentQuantity) || componentQuantity <= 0) {
         continue;
       }
 
@@ -937,29 +1051,22 @@ const components = await getBundleComponents(bundleId);
        * ID товара/модификации
        */
 
-      const componentHref = componentMeta.href
-        .split("?")[0];
+      const componentHref = componentMeta.href.split("?")[0];
 
-      const componentId = componentHref
-        .split("/")
-        .pop();
+      const componentId = componentHref.split("/").pop();
 
       /*
        * Ищем остаток компонента
        */
 
       const stockItem = stockRows.find((item) => {
-        const href = item.meta?.href
-          ?.split("?")[0];
+        const href = item.meta?.href?.split("?")[0];
 
         const id = href?.split("/").pop();
 
         return (
           id === componentId &&
-          (
-            item.meta?.type === componentMeta.type ||
-            !componentMeta.type
-          )
+          (item.meta?.type === componentMeta.type || !componentMeta.type)
         );
       });
 
@@ -970,13 +1077,9 @@ const components = await getBundleComponents(bundleId);
        * из этого компонента
        */
 
-      const componentBundles =
-        Math.floor(stock / componentQuantity);
+      const componentBundles = Math.floor(stock / componentQuantity);
 
-      possibleBundles = Math.min(
-        possibleBundles,
-        componentBundles,
-      );
+      possibleBundles = Math.min(possibleBundles, componentBundles);
 
       /*
        * Если хотя бы одного компонента нет —
@@ -994,10 +1097,7 @@ const components = await getBundleComponents(bundleId);
 
     return possibleBundles;
   } catch (error) {
-    console.error(
-      `Ошибка расчёта остатка комплекта "${bundle.name}":`,
-      error,
-    );
+    console.error(`Ошибка расчёта остатка комплекта "${bundle.name}":`, error);
 
     return 0;
   }
@@ -1006,7 +1106,6 @@ const components = await getBundleComponents(bundleId);
 const bundleComponentsCache = new Map();
 
 const BUNDLE_CACHE_TTL = 5 * 60 * 1000; // 5 минут
-
 
 // =========================================================
 // PRODUCTS CACHE
@@ -1023,10 +1122,7 @@ const productsLoading = new Map();
 async function getBundleComponents(bundleId) {
   const cached = bundleComponentsCache.get(bundleId);
 
-  if (
-    cached &&
-    Date.now() - cached.timestamp < BUNDLE_CACHE_TTL
-  ) {
+  if (cached && Date.now() - cached.timestamp < BUNDLE_CACHE_TTL) {
     return cached.components;
   }
 
@@ -1074,9 +1170,7 @@ async function getAllMoySkladRows(path, pageSize = 1000) {
 }
 async function refreshProductsCache(storeId) {
   if (productsLoading.has(storeId)) {
-    console.log(
-      `PRODUCTS: обновление уже выполняется для ${storeId}`,
-    );
+    console.log(`PRODUCTS: обновление уже выполняется для ${storeId}`);
 
     return productsLoading.get(storeId);
   }
@@ -1088,12 +1182,9 @@ async function refreshProductsCache(storeId) {
       console.log("Store:", storeId);
       console.log("================================");
 
-      const storeHref =
-        `${MOYSKLAD_API}/entity/store/${storeId}`;
+      const storeHref = `${MOYSKLAD_API}/entity/store/${storeId}`;
 
-      const filterParam = encodeURIComponent(
-        `store=${storeHref}`,
-      );
+      const filterParam = encodeURIComponent(`store=${storeHref}`);
 
       /*
        * =================================================
@@ -1109,9 +1200,7 @@ async function refreshProductsCache(storeId) {
         `/report/stock/all?filter=${filterParam}`,
       );
 
-      console.log(
-        `Получено позиций с остатками: ${stockRows.length}`,
-      );
+      console.log(`Получено позиций с остатками: ${stockRows.length}`);
 
       /*
        * =================================================
@@ -1119,13 +1208,9 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const productRows = await getAllMoySkladRows(
-        `/entity/product`,
-      );
+      const productRows = await getAllMoySkladRows(`/entity/product`);
 
-      console.log(
-        `Получено обычных товаров: ${productRows.length}`,
-      );
+      console.log(`Получено обычных товаров: ${productRows.length}`);
 
       /*
        * =================================================
@@ -1133,13 +1218,9 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const variantRows = await getAllMoySkladRows(
-        `/entity/variant`,
-      );
+      const variantRows = await getAllMoySkladRows(`/entity/variant`);
 
-      console.log(
-        `Получено модификаций: ${variantRows.length}`,
-      );
+      console.log(`Получено модификаций: ${variantRows.length}`);
 
       /*
        * =================================================
@@ -1147,13 +1228,9 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const bundles = await getAllMoySkladRows(
-        `/entity/bundle`,
-      );
+      const bundles = await getAllMoySkladRows(`/entity/bundle`);
 
-      console.log(
-        `Получено комплектов: ${bundles.length}`,
-      );
+      console.log(`Получено комплектов: ${bundles.length}`);
 
       /*
        * =================================================
@@ -1171,20 +1248,15 @@ async function refreshProductsCache(storeId) {
 
         const cleanHref = rawHref.split("?")[0];
 
-        const id =
-          cleanHref.split("/").pop() || "";
+        const id = cleanHref.split("/").pop() || "";
 
         if (!id) {
           continue;
         }
 
-        const type =
-          item.meta?.type || "product";
+        const type = item.meta?.type || "product";
 
-        stockMap.set(
-          `${type}:${id}`,
-          item,
-        );
+        stockMap.set(`${type}:${id}`, item);
       }
 
       /*
@@ -1198,32 +1270,20 @@ async function refreshProductsCache(storeId) {
          * Для stock report
          */
 
-        if (
-          stockItem?.salePrice != null
-        ) {
-          return Number(
-            stockItem.salePrice,
-          ) / 100;
+        if (stockItem?.salePrice != null) {
+          return Number(stockItem.salePrice) / 100;
         }
 
         /*
          * Для product / variant
          */
 
-        if (
-          item.salePrices?.[0]?.value != null
-        ) {
-          return Number(
-            item.salePrices[0].value,
-          ) / 100;
+        if (item.salePrices?.[0]?.value != null) {
+          return Number(item.salePrices[0].value) / 100;
         }
 
-        if (
-          item.salePrice?.value != null
-        ) {
-          return Number(
-            item.salePrice.value,
-          ) / 100;
+        if (item.salePrice?.value != null) {
+          return Number(item.salePrice.value) / 100;
         }
 
         return 0;
@@ -1240,12 +1300,8 @@ async function refreshProductsCache(storeId) {
          * В stock report цена закупки
          */
 
-        if (
-          stockItem?.price != null
-        ) {
-          return Number(
-            stockItem.price,
-          ) / 100;
+        if (stockItem?.price != null) {
+          return Number(stockItem.price) / 100;
         }
 
         /*
@@ -1253,24 +1309,16 @@ async function refreshProductsCache(storeId) {
          * может быть числом
          */
 
-        if (
-          typeof item.buyPrice === "number"
-        ) {
-          return Number(
-            item.buyPrice,
-          ) / 100;
+        if (typeof item.buyPrice === "number") {
+          return Number(item.buyPrice) / 100;
         }
 
         /*
          * Или объектом { value: ... }
          */
 
-        if (
-          item.buyPrice?.value != null
-        ) {
-          return Number(
-            item.buyPrice.value,
-          ) / 100;
+        if (item.buyPrice?.value != null) {
+          return Number(item.buyPrice.value) / 100;
         }
 
         return 0;
@@ -1283,17 +1331,11 @@ async function refreshProductsCache(storeId) {
        */
 
       function getEntityId(item) {
-        const rawHref =
-          item.meta?.href || "";
+        const rawHref = item.meta?.href || "";
 
-        const cleanHref =
-          rawHref.split("?")[0];
+        const cleanHref = rawHref.split("?")[0];
 
-        return (
-          cleanHref.split("/").pop() ||
-          item.id ||
-          ""
-        );
+        return cleanHref.split("/").pop() || item.id || "";
       }
 
       /*
@@ -1302,29 +1344,14 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      function normalizeCatalogItem(
-        item,
-        type,
-      ) {
-        const id =
-          getEntityId(item);
+      function normalizeCatalogItem(item, type) {
+        const id = getEntityId(item);
 
-        const stockItem =
-          stockMap.get(
-            `${type}:${id}`,
-          );
+        const stockItem = stockMap.get(`${type}:${id}`);
 
-        const price =
-          getSalePrice(
-            item,
-            stockItem,
-          );
+        const price = getSalePrice(item, stockItem);
 
-        const buyPrice =
-          getBuyPrice(
-            item,
-            stockItem,
-          );
+        const buyPrice = getBuyPrice(item, stockItem);
 
         /*
          * Если позиции нет в stock report,
@@ -1333,57 +1360,34 @@ async function refreshProductsCache(storeId) {
          * Просто остаток будет 0.
          */
 
-        const stock =
-          stockItem
-            ? Number(
-                stockItem.stock || 0,
-              )
-            : 0;
+        const stock = stockItem ? Number(stockItem.stock || 0) : 0;
 
-        const reserve =
-          stockItem
-            ? Number(
-                stockItem.reserve || 0,
-              )
-            : 0;
+        const reserve = stockItem ? Number(stockItem.reserve || 0) : 0;
 
-        const inTransit =
-          stockItem
-            ? Number(
-                stockItem.inTransit || 0,
-              )
-            : 0;
+        const inTransit = stockItem ? Number(stockItem.inTransit || 0) : 0;
 
-        const reserveStock =
-          stockItem
-            ? Number(
-                stockItem.reserveStock || 0,
-              )
-            : 0;
+        const reserveStock = stockItem
+          ? Number(stockItem.reserveStock || 0)
+          : 0;
 
         return {
           id,
 
           name:
             item.name ||
-            (
-              type === "variant"
-                ? "Модификация без названия"
-                : "Товар без названия"
-            ),
+            (type === "variant"
+              ? "Модификация без названия"
+              : "Товар без названия"),
 
-          code:
-            item.code || "",
+          code: item.code || "",
 
-          article:
-            item.article || "",
+          article: item.article || "",
 
           price,
 
           buyPrice,
 
-          costPrice:
-            buyPrice,
+          costPrice: buyPrice,
 
           stock,
 
@@ -1393,13 +1397,9 @@ async function refreshProductsCache(storeId) {
 
           reserveStock,
 
-          meta:
-            item.meta,
+          meta: item.meta,
 
-          uom:
-            item.uom?.name ||
-            stockItem?.uom?.name ||
-            "шт",
+          uom: item.uom?.name || stockItem?.uom?.name || "шт",
 
           pathName:
             item.productFolder?.name ||
@@ -1408,22 +1408,18 @@ async function refreshProductsCache(storeId) {
             stockItem?.productFolder?.name ||
             "Общая категория",
 
-          description:
-            item.description ||
-            "",
+          description: item.description || "",
 
           type,
 
-          isBundle:
-            false,
+          isBundle: false,
 
           /*
            * Дополнительно сохраняем,
            * что это именно модификация.
            */
 
-          isVariant:
-            type === "variant",
+          isVariant: type === "variant",
         };
       }
 
@@ -1433,14 +1429,9 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const products =
-        productRows.map(
-          (item) =>
-            normalizeCatalogItem(
-              item,
-              "product",
-            ),
-        );
+      const products = productRows.map((item) =>
+        normalizeCatalogItem(item, "product"),
+      );
 
       /*
        * =================================================
@@ -1448,14 +1439,9 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const variants =
-        variantRows.map(
-          (item) =>
-            normalizeCatalogItem(
-              item,
-              "variant",
-            ),
-        );
+      const variants = variantRows.map((item) =>
+        normalizeCatalogItem(item, "variant"),
+      );
 
       /*
        * =================================================
@@ -1467,55 +1453,36 @@ async function refreshProductsCache(storeId) {
 
       for (const bundle of bundles) {
         try {
-          const bundleId =
-            getEntityId(bundle);
+          const bundleId = getEntityId(bundle);
 
           const price =
             bundle.salePrices?.[0]?.value != null
-              ? Number(
-                  bundle.salePrices[0].value,
-                ) / 100
+              ? Number(bundle.salePrices[0].value) / 100
               : 0;
 
           const buyPrice =
             bundle.buyPrice?.value != null
-              ? Number(
-                  bundle.buyPrice.value,
-                ) / 100
+              ? Number(bundle.buyPrice.value) / 100
               : typeof bundle.buyPrice === "number"
-                ? Number(
-                    bundle.buyPrice,
-                  ) / 100
+                ? Number(bundle.buyPrice) / 100
                 : 0;
 
-          const stock =
-            await calculateBundleStock(
-              bundle,
-              stockRows,
-            );
+          const stock = await calculateBundleStock(bundle, stockRows);
 
           bundleProducts.push({
-            id:
-              bundleId,
+            id: bundleId,
 
-            name:
-              bundle.name ||
-              "Комплект без названия",
+            name: bundle.name || "Комплект без названия",
 
-            code:
-              bundle.code ||
-              "",
+            code: bundle.code || "",
 
-            article:
-              bundle.article ||
-              "",
+            article: bundle.article || "",
 
             price,
 
             buyPrice,
 
-            costPrice:
-              buyPrice,
+            costPrice: buyPrice,
 
             stock,
 
@@ -1525,30 +1492,22 @@ async function refreshProductsCache(storeId) {
 
             reserveStock: 0,
 
-            meta:
-              bundle.meta,
+            meta: bundle.meta,
 
-            uom:
-              bundle.uom?.name ||
-              "шт",
+            uom: bundle.uom?.name || "шт",
 
             pathName:
               bundle.productFolder?.name ||
               bundle.folder?.name ||
               "Общая категория",
 
-            description:
-              bundle.description ||
-              "",
+            description: bundle.description || "",
 
-            type:
-              "bundle",
+            type: "bundle",
 
-            isBundle:
-              true,
+            isBundle: true,
 
-            isVariant:
-              false,
+            isVariant: false,
           });
         } catch (error) {
           console.error(
@@ -1564,11 +1523,7 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      const allProducts = [
-        ...products,
-        ...variants,
-        ...bundleProducts,
-      ];
+      const allProducts = [...products, ...variants, ...bundleProducts];
 
       /*
        * =================================================
@@ -1576,12 +1531,8 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      if (
-        allProducts.length === 0
-      ) {
-        throw new Error(
-          "МойСклад вернул пустой список товаров",
-        );
+      if (allProducts.length === 0) {
+        throw new Error("МойСклад вернул пустой список товаров");
       }
 
       /*
@@ -1593,23 +1544,17 @@ async function refreshProductsCache(storeId) {
       const result = {
         storeId,
 
-        storeName:
-          "Молодая Гвардия 41",
+        storeName: "Молодая Гвардия 41",
 
-        total:
-          allProducts.length,
+        total: allProducts.length,
 
-        productsCount:
-          products.length,
+        productsCount: products.length,
 
-        variantsCount:
-          variants.length,
+        variantsCount: variants.length,
 
-        bundlesCount:
-          bundleProducts.length,
+        bundlesCount: bundleProducts.length,
 
-        rows:
-          allProducts,
+        rows: allProducts,
       };
 
       /*
@@ -1618,56 +1563,31 @@ async function refreshProductsCache(storeId) {
        * =================================================
        */
 
-      productsCache.set(
-        storeId,
-        {
-          timestamp:
-            Date.now(),
+      productsCache.set(storeId, {
+        timestamp: Date.now(),
 
-          data:
-            result,
-        },
-      );
+        data: result,
+      });
 
       console.log("================================");
       console.log("PRODUCTS CACHE ОБНОВЛЁН");
-      console.log(
-        "Обычных товаров:",
-        products.length,
-      );
-      console.log(
-        "Модификаций:",
-        variants.length,
-      );
-      console.log(
-        "Комплектов:",
-        bundleProducts.length,
-      );
-      console.log(
-        "Всего:",
-        allProducts.length,
-      );
+      console.log("Обычных товаров:", products.length);
+      console.log("Модификаций:", variants.length);
+      console.log("Комплектов:", bundleProducts.length);
+      console.log("Всего:", allProducts.length);
       console.log("================================");
 
       return result;
     } catch (error) {
-      console.error(
-        "Ошибка обновления products:",
-        error.message,
-      );
+      console.error("Ошибка обновления products:", error.message);
 
       throw error;
     } finally {
-      productsLoading.delete(
-        storeId,
-      );
+      productsLoading.delete(storeId);
     }
   })();
 
-  productsLoading.set(
-    storeId,
-    loadingPromise,
-  );
+  productsLoading.set(storeId, loadingPromise);
 
   return loadingPromise;
 }
@@ -1678,9 +1598,7 @@ async function forceRefreshProductsCache(storeId = YOUNG_GUARD_ID) {
   try {
     const data = await refreshProductsCache(storeId);
 
-    console.log(
-      `✅ Кеш товаров обновлён: ${data?.rows?.length || 0} товаров`,
-    );
+    console.log(`✅ Кеш товаров обновлён: ${data?.rows?.length || 0} товаров`);
 
     return {
       success: true,
@@ -1689,10 +1607,7 @@ async function forceRefreshProductsCache(storeId = YOUNG_GUARD_ID) {
       cacheAge: 0,
     };
   } catch (error) {
-    console.error(
-      `❌ Ошибка принудительного обновления кеша:`,
-      error.message,
-    );
+    console.error(`❌ Ошибка принудительного обновления кеша:`, error.message);
 
     throw error;
   }
@@ -1713,9 +1628,7 @@ app.get("/api/moysklad/products", async (req, res) => {
     const cacheAge = Date.now() - cached.timestamp;
 
     console.log(
-      `PRODUCT CACHE: ${storeId}, возраст ${Math.round(
-        cacheAge / 1000,
-      )} сек`,
+      `PRODUCT CACHE: ${storeId}, возраст ${Math.round(cacheAge / 1000)} сек`,
     );
 
     /*
@@ -1774,17 +1687,12 @@ app.get("/api/moysklad/products", async (req, res) => {
       cacheAge: 0,
     });
   } catch (error) {
-    console.error(
-      "Ошибка первого получения товаров:",
-      error,
-    );
+    console.error("Ошибка первого получения товаров:", error);
 
     return res.status(500).json({
       success: false,
 
-      message:
-        error.message ||
-        "Ошибка получения товаров МойСклад",
+      message: error.message || "Ошибка получения товаров МойСклад",
     });
   }
 });
@@ -1885,36 +1793,15 @@ function validatePayment(payment, total) {
   const mplus = Number(payment.mplus || 0);
   const online_qr = Number(payment.online_qr || 0);
 
-  const values = [
-    cash,
-    card,
-    amanat,
-    mplus,
-    online_qr,
-  ];
+  const values = [cash, card, amanat, mplus, online_qr];
 
-  if (
-    values.some(
-      (value) =>
-        !Number.isFinite(value) || value < 0,
-    )
-  ) {
-    throw new Error(
-      "Суммы оплаты должны быть положительными числами",
-    );
+  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error("Суммы оплаты должны быть положительными числами");
   }
 
-  const paymentTotal =
-    cash +
-    card +
-    amanat +
-    mplus +
-    online_qr;
+  const paymentTotal = cash + card + amanat + mplus + online_qr;
 
-  if (
-    Math.round(paymentTotal) !==
-    Math.round(total)
-  ) {
+  if (Math.round(paymentTotal) !== Math.round(total)) {
     throw new Error(
       `Сумма оплаты (${paymentTotal}) не равна сумме заказа (${total})`,
     );
@@ -2066,14 +1953,13 @@ app.post("/api/moysklad/sales", async (req, res) => {
          ОПЛАТА
       ----------------------------------------- */
 
-  const cashSum =
-  normalizedPayment.cash;
+    const cashSum = normalizedPayment.cash;
 
-const noCashSum =
-  normalizedPayment.card +
-  normalizedPayment.amanat +
-  normalizedPayment.mplus +
-  normalizedPayment.online_qr;
+    const noCashSum =
+      normalizedPayment.card +
+      normalizedPayment.amanat +
+      normalizedPayment.mplus +
+      normalizedPayment.online_qr;
 
     /* -----------------------------------------
          ТЕКСТ ОПЛАТЫ
@@ -2092,7 +1978,7 @@ const noCashSum =
 
       `М+: ${(normalizedPayment.mplus / 100).toFixed(2)} сом`,
 
-`Онлайн QR: ${(normalizedPayment.online_qr / 100).toFixed(2)} сом`,
+      `Онлайн QR: ${(normalizedPayment.online_qr / 100).toFixed(2)} сом`,
 
       `Итого: ${(normalizedTotal / 100).toFixed(2)} сом`,
     ].join("\n");
@@ -2273,34 +2159,34 @@ const noCashSum =
       })),
 
       // Информация об оплате
-     payment: {
-  method: payment?.method || null,
+      payment: {
+        method: payment?.method || null,
 
-  cash: normalizedPayment.cash,
-  card: normalizedPayment.card,
-  amanat: normalizedPayment.amanat,
-  mplus: normalizedPayment.mplus,
-  online_qr: normalizedPayment.online_qr,
+        cash: normalizedPayment.cash,
+        card: normalizedPayment.card,
+        amanat: normalizedPayment.amanat,
+        mplus: normalizedPayment.mplus,
+        online_qr: normalizedPayment.online_qr,
 
-  cashSom: normalizedPayment.cash / 100,
-  cardSom: normalizedPayment.card / 100,
-  amanatSom: normalizedPayment.amanat / 100,
-  mplusSom: normalizedPayment.mplus / 100,
-  online_qrSom: normalizedPayment.online_qr / 100,
+        cashSom: normalizedPayment.cash / 100,
+        cardSom: normalizedPayment.card / 100,
+        amanatSom: normalizedPayment.amanat / 100,
+        mplusSom: normalizedPayment.mplus / 100,
+        online_qrSom: normalizedPayment.online_qr / 100,
 
-  paymentTotal: normalizedPayment.paymentTotal,
-},
+        paymentTotal: normalizedPayment.paymentTotal,
+      },
 
       // Суммы, отправленные в документ МойСклад
-    moyskladPayment: {
-  cashSum: cashSum,
-  noCashSum: noCashSum,
+      moyskladPayment: {
+        cashSum: cashSum,
+        noCashSum: noCashSum,
 
-  card: normalizedPayment.card,
-  amanat: normalizedPayment.amanat,
-  mplus: normalizedPayment.mplus,
-  online_qr: normalizedPayment.online_qr,
-},
+        card: normalizedPayment.card,
+        amanat: normalizedPayment.amanat,
+        mplus: normalizedPayment.mplus,
+        online_qr: normalizedPayment.online_qr,
+      },
 
       // Касса и смена
       // retailStoreId: retailStoreId,
@@ -2344,6 +2230,7 @@ const noCashSum =
       const cashTransaction = addSaleToCash(
         localSale.moyskladPayment.cashSum,
         salesperson,
+        localSale.orderId,
       );
 
       console.log("Продажа сохранена локально:", localSale.id);
@@ -2407,6 +2294,215 @@ const noCashSum =
 });
 
 // =========================================================
+// ОТМЕНА РОЗНИЧНОЙ ПРОДАЖИ
+// =========================================================
+//
+// 1. Находим локальную продажу по localSaleId
+// 2. Проверяем, не отменена ли она уже
+// 3. Удаляем retaildemand из МойСклад
+// 4. Если МойСклад успешно удалил документ,
+//    ставим cancelled: true в локальной истории
+//
+// Локальная продажа НЕ удаляется.
+// Она остаётся в истории как отменённая.
+// =========================================================
+
+// ============================================================
+// ОТМЕНА ПРОДАЖИ
+// ============================================================
+
+app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
+  try {
+    const { saleId } = req.params;
+
+    console.log("================================");
+    console.log("ОТМЕНА ПРОДАЖИ");
+    console.log("Sale ID:", saleId);
+    console.log("================================");
+
+    // ---------------------------------------------------------
+    // 1. Читаем существующие продажи
+    // ---------------------------------------------------------
+
+    const salesByDate = readSales();
+
+    let foundSale = null;
+    let foundDate = null;
+    let foundIndex = -1;
+
+    // Ищем продажу во всех датах
+    for (const [date, sales] of Object.entries(salesByDate)) {
+      if (!Array.isArray(sales)) {
+        continue;
+      }
+
+      const index = sales.findIndex(
+        (sale) => String(sale.id) === String(saleId),
+      );
+
+      if (index !== -1) {
+        foundSale = sales[index];
+        foundDate = date;
+        foundIndex = index;
+        break;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 2. Если продажа не найдена
+    // ---------------------------------------------------------
+
+    if (!foundSale) {
+      console.log("Продажа не найдена:", saleId);
+
+      return res.status(404).json({
+        success: false,
+        error: "Продажа не найдена",
+      });
+    }
+
+    // ---------------------------------------------------------
+    // 3. Проверяем, не отменена ли уже продажа
+    // ---------------------------------------------------------
+
+    if (foundSale.cancelled === true) {
+      return res.status(400).json({
+        success: false,
+        error: "Продажа уже отменена",
+        sale: foundSale,
+      });
+    }
+
+    // ---------------------------------------------------------
+    // 4. Проверяем MoySklad ID
+    // ---------------------------------------------------------
+
+    if (!foundSale.moyskladId) {
+      return res.status(400).json({
+        success: false,
+        error: "У продажи отсутствует moyskladId",
+      });
+    }
+
+    console.log("Локальная продажа найдена");
+    console.log("Дата:", foundDate);
+    console.log("MoySklad ID:", foundSale.moyskladId);
+    console.log("Сумма:", foundSale.totalSom);
+
+    // ---------------------------------------------------------
+    // 5. УДАЛЯЕМ RETAILDEMAND ИЗ МОЙСКЛАДА
+    // ---------------------------------------------------------
+
+    console.log("Удаляем retaildemand из МойСклад:", foundSale.moyskladId);
+
+    await deleteMoySkladRetailDemand(foundSale.moyskladId);
+
+    console.log("Retaildemand успешно удалён из МойСклад");
+
+    // ---------------------------------------------------------
+    // 6. ОПРЕДЕЛЯЕМ НАЛИЧНУЮ ЧАСТЬ ПРОДАЖИ
+    // ---------------------------------------------------------
+
+    const payment =
+      foundSale.payment && typeof foundSale.payment === "object"
+        ? foundSale.payment
+        : {};
+
+    const cashSum = Number(payment.cash || 0);
+
+    console.log("Наличная часть продажи:", cashSum / 100, "сом");
+
+    // ---------------------------------------------------------
+    // 7. ЕСЛИ БЫЛА НАЛИЧКА — ВОЗВРАЩАЕМ ЕЁ В CASH
+    // ---------------------------------------------------------
+
+    if (cashSum > 0) {
+      addReturnToCash(
+        cashSum,
+        foundSale.orderId || foundSale.id,
+        `CANCEL-${foundSale.id}`,
+        foundSale.moyskladId,
+        true
+      );
+
+      console.log(
+        "Наличная часть отменённой продажи вычтена из кассы:",
+        cashSum / 100,
+        "сом",
+      );
+    } else {
+      console.log("Наличной оплаты нет — cash.json не изменяем");
+    }
+
+    // ---------------------------------------------------------
+    // 8. Помечаем продажу отменённой
+    // ---------------------------------------------------------
+
+    const cancelledSale = {
+      ...foundSale,
+
+      cancelled: true,
+
+      cancelledAt: new Date().toISOString(),
+
+      cancellationReason: req.body?.reason || "Продажа отменена кассиром",
+    };
+
+    // ---------------------------------------------------------
+    // 9. Обновляем продажу в существующем массиве
+    // ---------------------------------------------------------
+
+    salesByDate[foundDate][foundIndex] = cancelledSale;
+
+    // ---------------------------------------------------------
+    // 10. Сохраняем через ТВОЙ writeSales()
+    // ---------------------------------------------------------
+
+    writeSales(salesByDate);
+
+    // ---------------------------------------------------------
+    // 11. Отправляем уведомление в Telegram
+    // ---------------------------------------------------------
+
+    try {
+      await sendTelegramCancellationNotification(cancelledSale);
+    } catch (telegramError) {
+      console.error(
+        "Не удалось отправить уведомление в Telegram:",
+        telegramError,
+      );
+    }
+
+    console.log("================================");
+    console.log("ПРОДАЖА УСПЕШНО ОТМЕНЕНА");
+    console.log("Sale ID:", cancelledSale.id);
+    console.log("MoySklad ID:", cancelledSale.moyskladId);
+    console.log("Дата:", foundDate);
+    console.log("================================");
+
+    // ---------------------------------------------------------
+    // 12. Отправляем результат фронту
+    // ---------------------------------------------------------
+
+    return res.json({
+      success: true,
+      message: "Продажа успешно отменена",
+      sale: cancelledSale,
+    });
+  } catch (error) {
+    console.error("================================");
+    console.error("ОШИБКА ОТМЕНЫ ПРОДАЖИ");
+    console.error(error);
+    console.error("================================");
+
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Не удалось отменить продажу",
+    });
+  }
+});
+
+// =========================================================
 // UPDATE SALESPERSON IN LOCAL SALE
 // =========================================================
 
@@ -2429,9 +2525,7 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
       });
     }
 
-    const salesperson = SALESPERSONS.find(
-      (item) => item.id === salespersonId,
-    );
+    const salesperson = SALESPERSONS.find((item) => item.id === salespersonId);
 
     if (!salesperson) {
       return res.status(404).json({
@@ -2452,9 +2546,7 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
         continue;
       }
 
-      const saleIndex = sales.findIndex(
-        (sale) => sale?.id === saleId,
-      );
+      const saleIndex = sales.findIndex((sale) => sale?.id === saleId);
 
       if (saleIndex === -1) {
         continue;
@@ -2496,16 +2588,11 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
       sale: updatedSale,
     });
   } catch (error) {
-    console.error(
-      "Ошибка изменения продавца продажи:",
-      error,
-    );
+    console.error("Ошибка изменения продавца продажи:", error);
 
     return res.status(500).json({
       success: false,
-      message:
-        error.message ||
-        "Не удалось изменить продавца",
+      message: error.message || "Не удалось изменить продавца",
     });
   }
 });
@@ -2672,9 +2759,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
       const quantity = Number(item.quantity);
 
       if (!Number.isFinite(quantity) || quantity <= 0) {
-        throw new Error(
-          `Некорректное количество товара "${item.name || ""}"`,
-        );
+        throw new Error(`Некорректное количество товара "${item.name || ""}"`);
       }
 
       const type = item.type || "product";
@@ -2688,9 +2773,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
       const price = Math.round(Number(item.price || 0) * 100);
 
       if (!Number.isFinite(price) || price < 0) {
-        throw new Error(
-          `Некорректная цена товара "${item.name || ""}"`,
-        );
+        throw new Error(`Некорректная цена товара "${item.name || ""}"`);
       }
 
       return {
@@ -2727,10 +2810,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
     const retailSalesReturnData = {
       name: returnId,
 
-      moment: new Date()
-        .toISOString()
-        .slice(0, 19)
-        .replace("T", " "),
+      moment: new Date().toISOString().slice(0, 19).replace("T", " "),
 
       description: `POS возврат${orderId ? `: ${orderId}` : ""}`,
 
@@ -2900,9 +2980,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
      * Только наличные уменьшают cash.json.
      */
 
-    const localCashSum = payment
-      ? cashSum
-      : normalizedTotal;
+    const localCashSum = payment ? cashSum : normalizedTotal;
 
     console.log(
       "Сумма возврата наличными для cash.json:",
@@ -2950,14 +3028,9 @@ app.post("/api/moysklad/returns", async (req, res) => {
         retailSalesReturn?.id || null,
       );
 
-      console.log(
-        "Деньги за возврат списаны из кассы:",
-        cashTransaction,
-      );
+      console.log("Деньги за возврат списаны из кассы:", cashTransaction);
     } else {
-      console.log(
-        "Возврат без наличных — cash.json не изменяется",
-      );
+      console.log("Возврат без наличных — cash.json не изменяется");
     }
 
     /*
@@ -2987,10 +3060,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
     if (fs.existsSync(RETURNS_FILE)) {
       try {
-        const fileData = fs.readFileSync(
-          RETURNS_FILE,
-          "utf8",
-        );
+        const fileData = fs.readFileSync(RETURNS_FILE, "utf8");
 
         if (fileData.trim()) {
           returns = JSON.parse(fileData);
@@ -3000,10 +3070,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
           returns = [];
         }
       } catch (fileError) {
-        console.error(
-          "Ошибка чтения returns.json:",
-          fileError,
-        );
+        console.error("Ошибка чтения returns.json:", fileError);
 
         returns = [];
       }
@@ -3029,8 +3096,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
       demandId: demandId || null,
 
-      returnDocumentId:
-        retailSalesReturn?.id || null,
+      returnDocumentId: retailSalesReturn?.id || null,
 
       retailShiftSyncId,
 
@@ -3047,9 +3113,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
       cashSum: localCashSum / 100,
 
-      noCashSum: payment
-        ? noCashSum / 100
-        : 0,
+      noCashSum: payment ? noCashSum / 100 : 0,
 
       items: items.map((item) => {
         const quantity = Number(item.quantity);
@@ -3087,10 +3151,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
      */
 
     returns.sort((a, b) => {
-      return (
-        new Date(b.date).getTime() -
-        new Date(a.date).getTime()
-      );
+      return new Date(b.date).getTime() - new Date(a.date).getTime();
     });
 
     /*
@@ -3099,16 +3160,9 @@ app.post("/api/moysklad/returns", async (req, res) => {
      * ==========================================
      */
 
-    fs.writeFileSync(
-      RETURNS_FILE,
-      JSON.stringify(returns, null, 2),
-      "utf8",
-    );
+    fs.writeFileSync(RETURNS_FILE, JSON.stringify(returns, null, 2), "utf8");
 
-    console.log(
-      "Возврат сохранён в returns.json:",
-      returnRecord,
-    );
+    console.log("Возврат сохранён в returns.json:", returnRecord);
 
     /*
      * ==========================================
@@ -3121,8 +3175,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
       returnId,
 
-      returnDocumentId:
-        retailSalesReturn?.id || null,
+      returnDocumentId: retailSalesReturn?.id || null,
 
       /*
        * Общая сумма в копейках
@@ -3137,9 +3190,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
       /*
        * Безналичные в копейках
        */
-      noCashSum: payment
-        ? noCashSum
-        : 0,
+      noCashSum: payment ? noCashSum : 0,
 
       retailShiftSyncId,
 
@@ -3158,34 +3209,23 @@ app.post("/api/moysklad/returns", async (req, res) => {
       retailSalesReturn,
     });
   } catch (error) {
-    console.error(
-      "Ошибка создания розничного возврата:",
-      error,
-    );
+    console.error("Ошибка создания розничного возврата:", error);
 
     /*
      * Если ошибка пришла от МойСклад,
      * показываем её максимально подробно.
      */
 
-    const moySkladError =
-      error?.response?.data ||
-      error?.data;
+    const moySkladError = error?.response?.data || error?.data;
 
-    console.error(
-      "Детали ошибки МойСклад:",
-      moySkladError,
-    );
+    console.error("Детали ошибки МойСклад:", moySkladError);
 
     return res.status(500).json({
       success: false,
 
-      message:
-        error.message ||
-        "Ошибка создания розничного возврата",
+      message: error.message || "Ошибка создания розничного возврата",
 
-      moySkladError:
-        moySkladError || null,
+      moySkladError: moySkladError || null,
     });
   }
 });

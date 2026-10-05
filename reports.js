@@ -5,13 +5,16 @@ const path = require("path");
 const router = express.Router();
 
 const DATA_DIR = path.join(__dirname, "..", "data");
+
 const multer = require("multer");
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 20 * 1024 * 1024,
   },
 });
+
 /*
 |--------------------------------------------------------------------------
 | HELPERS
@@ -116,20 +119,6 @@ function emptyDay() {
 |--------------------------------------------------------------------------
 */
 
-/**
- * Возвращает объект payment.
- *
- * Поддерживает:
- * {
- *   payment: {
- *     cash: 1000,
- *     card: 2000
- *   }
- * }
- *
- * И вариант, когда payment находится непосредственно
- * в объекте продажи.
- */
 function getPaymentObject(item) {
   if (!item || typeof item !== "object") {
     return {};
@@ -146,10 +135,6 @@ function getPaymentObject(item) {
   return item;
 }
 
-/**
- * Получает первое найденное числовое значение
- * из переданных ключей.
- */
 function getPaymentAmount(payment, keys) {
   for (const key of keys) {
     if (
@@ -163,68 +148,37 @@ function getPaymentAmount(payment, keys) {
 
   return 0;
 }
+
 function normalizeSalesData(sales) {
   if (Array.isArray(sales)) {
     return sales;
   }
 
-  if (
-    sales &&
-    typeof sales === "object" &&
-    !Array.isArray(sales)
-  ) {
+  if (sales && typeof sales === "object" && !Array.isArray(sales)) {
     return Object.values(sales).flatMap((daySales) => {
-      return Array.isArray(daySales)
-        ? daySales
-        : [];
+      return Array.isArray(daySales) ? daySales : [];
     });
   }
 
   return [];
 }
-/**
- * Добавляет сумму продажи в разбивку по способам оплаты.
- *
- * Поддерживаемые способы:
- * cash
- * card
- * amanat
- * mplus
- * local
- *
- * Также поддерживаются:
- * credit -> amanat
- * delivery -> mplus
- * paymentMethod
- * paymentType
- * method
- */
+
 function addPaymentToSummary(
   salesByPayment,
   item,
-  fallbackAmount = 0
+  fallbackAmount = 0,
 ) {
   const payment = getPaymentObject(item);
 
   /*
   |--------------------------------------------------------------------------
-  | В sales.json платежи хранятся в копейках:
-  |
-  | cash: 5000       -> 50 сом
-  | card: 25000      -> 250 сом
-  | online_qr: 5000  -> 50 сом
-  |
-  | Поэтому здесь переводим копейки в сомы.
+  | В sales.json платежи хранятся в копейках
   |--------------------------------------------------------------------------
   */
 
-  const cashKopecks = getPaymentAmount(payment, [
-    "cash",
-  ]);
+  const cashKopecks = getPaymentAmount(payment, ["cash"]);
 
-  const cardKopecks = getPaymentAmount(payment, [
-    "card",
-  ]);
+  const cardKopecks = getPaymentAmount(payment, ["card"]);
 
   const amanatKopecks = getPaymentAmount(payment, [
     "amanat",
@@ -255,12 +209,6 @@ function addPaymentToSummary(
     localKopecks > 0 ||
     onlineQrKopecks > 0;
 
-  /*
-  |--------------------------------------------------------------------------
-  | Если есть реальные payment-поля
-  |--------------------------------------------------------------------------
-  */
-
   if (hasPaymentFields) {
     const cash = cashKopecks / 100;
     const card = cardKopecks / 100;
@@ -286,12 +234,6 @@ function addPaymentToSummary(
     );
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | Обычная продажа, где payment содержит только method
-  |--------------------------------------------------------------------------
-  */
-
   const method =
     payment.method ||
     payment.paymentMethod ||
@@ -300,26 +242,17 @@ function addPaymentToSummary(
     item?.paymentMethod ||
     item?.paymentType;
 
-  /*
-  |--------------------------------------------------------------------------
-  | fallbackAmount уже находится в сомах,
-  | потому что сюда передаётся sale.totalSom / sale.total
-  |--------------------------------------------------------------------------
-  */
-
   const amount = Math.abs(
     toNumber(
       fallbackAmount ||
         item?.totalSom ||
         item?.total ||
         item?.sum ||
-        item?.amount
-    )
+        item?.amount,
+    ),
   );
 
-  const normalizedMethod = String(
-    method || ""
-  )
+  const normalizedMethod = String(method || "")
     .trim()
     .toLowerCase();
 
@@ -371,6 +304,33 @@ function addPaymentToSummary(
 
   return amount;
 }
+
+/*
+|--------------------------------------------------------------------------
+| RESERVATION HELPERS
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Получаем ID брони из кассовой транзакции.
+ *
+ * Поддерживаются разные варианты,
+ * которые могли использоваться в старых версиях.
+ */
+function getReservationIdFromTransaction(transaction) {
+  if (!transaction || typeof transaction !== "object") {
+    return null;
+  }
+
+  return (
+    transaction.reservationId ||
+    transaction.bookingId ||
+    transaction.reservation?.id ||
+    transaction.booking?.id ||
+    null
+  );
+}
+
 /*
 |--------------------------------------------------------------------------
 | ROUTE: REPORTS
@@ -379,10 +339,7 @@ function addPaymentToSummary(
 
 router.get("/", async (req, res) => {
   try {
-    const {
-      from = "",
-      to = "",
-    } = req.query;
+    const { from = "", to = "" } = req.query;
 
     const range = normalizeDateRange(from, to);
 
@@ -397,34 +354,73 @@ router.get("/", async (req, res) => {
       transactions: [],
     });
 
-    const expenses = await readJson(
-      "expenses.json",
-      []
+    const expenses = await readJson("expenses.json", []);
+
+    const sales = await readJson("sales.json", []);
+
+    const reservations = await readJson("reservations.json", []);
+
+    const purchases = await readJson("purchases.json", []);
+
+    const transfers = await readJson("transfers.json", []);
+
+    const returns = await readJson("returns.json", []);
+
+    const salesArray = normalizeSalesData(sales);
+
+    /*
+    |--------------------------------------------------------------------------
+    | RESERVATIONS
+    |--------------------------------------------------------------------------
+    */
+
+    const reservationsArray = Array.isArray(reservations)
+      ? reservations
+      : [];
+
+    /*
+    |--------------------------------------------------------------------------
+    | ID ОТМЕНЁННЫХ БРОНЕЙ
+    |--------------------------------------------------------------------------
+    */
+
+    const cancelledReservationIds = new Set(
+      reservationsArray
+        .filter(
+          (reservation) =>
+            String(reservation.status || "").toLowerCase() ===
+            "cancelled",
+        )
+        .filter((reservation) => reservation.id)
+        .map((reservation) => String(reservation.id)),
     );
 
-    const sales = await readJson(
-      "sales.json",
-      []
+    /*
+    |--------------------------------------------------------------------------
+    | Только действующие брони
+    |--------------------------------------------------------------------------
+    */
+
+    const activeReservations = reservationsArray.filter(
+      (reservation) =>
+        String(reservation.status || "").toLowerCase() !==
+        "cancelled",
     );
 
-    const reservations = await readJson(
-      "reservations.json",
-      []
-    );
+    /*
+    |--------------------------------------------------------------------------
+    | CANCELLED SALES
+    |--------------------------------------------------------------------------
+    */
 
-    const purchases = await readJson(
-      "purchases.json",
-      []
-    );
-
-    const transfers = await readJson(
-      "transfers.json",
-      []
-    );
-
-    const returns = await readJson(
-      "returns.json",
-      []
+    const cancelledOrderIds = new Set(
+      salesArray
+        .filter(
+          (sale) =>
+            sale.cancelled === true &&
+            sale.orderId,
+        )
+        .map((sale) => String(sale.orderId)),
     );
 
     /*
@@ -433,26 +429,25 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const cashTransactions = Array.isArray(
-      cash.transactions
-    )
+    const cashTransactions = Array.isArray(cash.transactions)
       ? cash.transactions
       : [];
 
-    const filteredCashTransactions =
-      cashTransactions.filter((transaction) => {
+    const filteredCashTransactions = cashTransactions.filter(
+      (transaction) => {
         const date = getDate(
           transaction.createdAt ||
             transaction.date ||
-            transaction.updatedAt
+            transaction.updatedAt,
         );
 
         return isDateInRange(
           date,
           range.from,
-          range.to
+          range.to,
         );
-      });
+      },
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -461,68 +456,134 @@ router.get("/", async (req, res) => {
     */
 
     let cashSales = 0;
+
     let cashReservations = 0;
+
+    let cancelledReservationDeposits = 0;
+
     let cashExpenses = 0;
+
     let cashReturns = 0;
+
     let supplierPayments = 0;
+
     let deposits = 0;
+
     let withdraws = 0;
 
     const operationTypes = {};
 
-    filteredCashTransactions.forEach(
-      (transaction) => {
-        const type =
-          transaction.type || "unknown";
+    filteredCashTransactions.forEach((transaction) => {
+      const type = transaction.type || "unknown";
 
-        const amount = toNumber(
-          transaction.amount
-        );
+      const amount = toNumber(transaction.amount);
 
+      /*
+      |--------------------------------------------------------------------------
+      | ОТМЕНЁННАЯ ПРОДАЖА
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        type === "sale" &&
+        transaction.orderId &&
+        cancelledOrderIds.has(
+          String(transaction.orderId),
+        )
+      ) {
+        return;
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | БРОНИРОВАНИЕ
+      |--------------------------------------------------------------------------
+      */
+
+      if (type === "reservation") {
+        const reservationId =
+          getReservationIdFromTransaction(transaction);
+
+        /*
+        | Если кассовая транзакция напрямую связана
+        | с отменённой бронью — НЕ считаем её приходом.
+        */
+        if (
+          reservationId &&
+          cancelledReservationIds.has(
+            String(reservationId),
+          )
+        ) {
+          /*
+          | Сохраняем отдельно для правильного netCashFlow.
+          |
+          | Например:
+          | deposit 500
+          | refund 500
+          |
+          | Приход = 0
+          | Возврат = 500
+          | Но реальный денежный поток = 0.
+          */
+          if (amount > 0) {
+            cancelledReservationDeposits += Math.abs(amount);
+          }
+
+          return;
+        }
+
+        /*
+        | Обычная действующая бронь
+        */
         operationTypes[type] =
           (operationTypes[type] || 0) +
           Math.abs(amount);
 
-        switch (type) {
-          case "sale":
-            cashSales += Math.max(amount, 0);
-            break;
+        cashReservations += Math.max(amount, 0);
 
-          case "reservation":
-            cashReservations += Math.max(
-              amount,
-              0
-            );
-            break;
-
-          case "Rashod":
-          case "expense":
-            cashExpenses += Math.abs(amount);
-            break;
-
-          case "return":
-            cashReturns += Math.abs(amount);
-            break;
-
-          case "buyFromPostavshik":
-            supplierPayments += Math.abs(
-              amount
-            );
-            break;
-
-          case "deposit":
-            deposits += Math.abs(amount);
-            break;
-
-          case "withdraw":
-            withdraws += Math.abs(amount);
-            break;
-
-          default:
-            break;
-        }
+        return;
       }
-    );
+
+      /*
+      |--------------------------------------------------------------------------
+      | ОСТАЛЬНЫЕ ОПЕРАЦИИ
+      |--------------------------------------------------------------------------
+      */
+
+      operationTypes[type] =
+        (operationTypes[type] || 0) +
+        Math.abs(amount);
+
+      switch (type) {
+        case "sale":
+          cashSales += Math.max(amount, 0);
+          break;
+
+        case "Rashod":
+        case "expense":
+          cashExpenses += Math.abs(amount);
+          break;
+
+        case "return":
+          cashReturns += Math.abs(amount);
+          break;
+
+        case "buyFromPostavshik":
+          supplierPayments += Math.abs(amount);
+          break;
+
+        case "deposit":
+          deposits += Math.abs(amount);
+          break;
+
+        case "withdraw":
+          withdraws += Math.abs(amount);
+          break;
+
+        default:
+          break;
+      }
+    });
 
     /*
     |--------------------------------------------------------------------------
@@ -530,26 +591,25 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const expensesArray = Array.isArray(
-      expenses
-    )
+    const expensesArray = Array.isArray(expenses)
       ? expenses
       : [];
 
-    const filteredExpenses =
-      expensesArray.filter((expense) => {
+    const filteredExpenses = expensesArray.filter(
+      (expense) => {
         const date = getDate(
           expense.createdAt ||
             expense.date ||
-            expense.updatedAt
+            expense.updatedAt,
         );
 
         return isDateInRange(
           date,
           range.from,
-          range.to
+          range.to,
         );
-      });
+      },
+    );
 
     const expenseCategories = {};
 
@@ -557,12 +617,11 @@ router.get("/", async (req, res) => {
 
     filteredExpenses.forEach((expense) => {
       const amount = Math.abs(
-        toNumber(expense.amount)
+        toNumber(expense.amount),
       );
 
       const category =
-        expense.category ||
-        "Без категории";
+        expense.category || "Без категории";
 
       totalExpenses += amount;
 
@@ -577,31 +636,49 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
- const salesArray = normalizeSalesData(sales);
-
-    const filteredSales = salesArray.filter(
-      (sale) => {
-        const date = getDate(
-          sale.createdAt ||
-            sale.date ||
-            sale.updatedAt
-        );
-
-        return isDateInRange(
-          date,
-          range.from,
-          range.to
-        );
+    const filteredSales = salesArray.filter((sale) => {
+      /*
+      | Отменённые продажи полностью исключаем.
+      */
+      if (sale.cancelled === true) {
+        return false;
       }
-    );
+
+      const date = getDate(
+        sale.createdAt ||
+          sale.date ||
+          sale.updatedAt,
+      );
+
+      return isDateInRange(
+        date,
+        range.from,
+        range.to,
+      );
+    });
 
     const cashSaleTransactions =
       filteredCashTransactions.filter(
-        (transaction) =>
-          transaction.type === "sale"
+        (transaction) => {
+          if (transaction.type !== "sale") {
+            return false;
+          }
+
+          if (
+            transaction.orderId &&
+            cancelledOrderIds.has(
+              String(transaction.orderId),
+            )
+          ) {
+            return false;
+          }
+
+          return true;
+        },
       );
 
     let salesTotal = 0;
+
     let salesCount = 0;
 
     const salesByPayment = {
@@ -610,7 +687,7 @@ router.get("/", async (req, res) => {
       amanat: 0,
       mplus: 0,
       local: 0,
-       online_qr: 0,
+      online_qr: 0,
     };
 
     /*
@@ -623,40 +700,38 @@ router.get("/", async (req, res) => {
       salesCount = filteredSales.length;
 
       filteredSales.forEach((sale) => {
-       const total = Math.abs(
-  toNumber(
-    sale.totalSom ??
-      sale.total ??
-      sale.sum ??
-      sale.amount
-  )
-);
+        const total = Math.abs(
+          toNumber(
+            sale.totalSom ??
+              sale.total ??
+              sale.sum ??
+              sale.amount,
+          ),
+        );
 
         salesTotal += total;
 
         addPaymentToSummary(
           salesByPayment,
           sale,
-          total
+          total,
         );
       });
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Если sales.json пустой,
-    | используем продажи из cash.json
+    | Если sales.json пустой
     |--------------------------------------------------------------------------
     */
 
     if (filteredSales.length === 0) {
-      salesCount =
-        cashSaleTransactions.length;
+      salesCount = cashSaleTransactions.length;
 
       cashSaleTransactions.forEach(
         (transaction) => {
           const amount = Math.abs(
-            toNumber(transaction.amount)
+            toNumber(transaction.amount),
           );
 
           salesTotal += amount;
@@ -664,26 +739,25 @@ router.get("/", async (req, res) => {
           addPaymentToSummary(
             salesByPayment,
             transaction,
-            amount
+            amount,
           );
-        }
+        },
       );
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Если sales.json содержит продажи,
-    | но не содержит информацию об оплате,
-    | используем данные из cash.json
+    | Если sales.json не содержит оплату
     |--------------------------------------------------------------------------
     */
-const paymentTotalFromSales =
-  salesByPayment.cash +
-  salesByPayment.card +
-  salesByPayment.amanat +
-  salesByPayment.mplus +
-  salesByPayment.local +
-  salesByPayment.online_qr;
+
+    const paymentTotalFromSales =
+      salesByPayment.cash +
+      salesByPayment.card +
+      salesByPayment.amanat +
+      salesByPayment.mplus +
+      salesByPayment.local +
+      salesByPayment.online_qr;
 
     if (
       filteredSales.length > 0 &&
@@ -700,15 +774,15 @@ const paymentTotalFromSales =
       cashSaleTransactions.forEach(
         (transaction) => {
           const amount = Math.abs(
-            toNumber(transaction.amount)
+            toNumber(transaction.amount),
           );
 
           addPaymentToSummary(
             salesByPayment,
             transaction,
-            amount
+            amount,
           );
-        }
+        },
       );
     }
 
@@ -718,27 +792,21 @@ const paymentTotalFromSales =
     |--------------------------------------------------------------------------
     */
 
-    const reservationsArray = Array.isArray(
-      reservations
-    )
-      ? reservations
-      : [];
-
     const filteredReservations =
-      reservationsArray.filter(
+      activeReservations.filter(
         (reservation) => {
           const date = getDate(
             reservation.createdAt ||
               reservation.date ||
-              reservation.updatedAt
+              reservation.updatedAt,
           );
 
           return isDateInRange(
             date,
             range.from,
-            range.to
+            range.to,
           );
-        }
+        },
       );
 
     let reservationsTotal = 0;
@@ -749,10 +817,10 @@ const paymentTotalFromSales =
           toNumber(
             reservation.total ??
               reservation.totalAmount ??
-              reservation.amount
-          )
+              reservation.amount,
+          ),
         );
-      }
+      },
     );
 
     /*
@@ -761,9 +829,7 @@ const paymentTotalFromSales =
     |--------------------------------------------------------------------------
     */
 
-    const purchasesArray = Array.isArray(
-      purchases
-    )
+    const purchasesArray = Array.isArray(purchases)
       ? purchases
       : [];
 
@@ -772,27 +838,29 @@ const paymentTotalFromSales =
         const date = getDate(
           purchase.createdAt ||
             purchase.date ||
-            purchase.updatedAt
+            purchase.updatedAt,
         );
 
         return isDateInRange(
           date,
           range.from,
-          range.to
+          range.to,
         );
       });
 
     let purchasesTotal = 0;
 
-    filteredPurchases.forEach((purchase) => {
-      purchasesTotal += Math.abs(
-        toNumber(
-          purchase.total ??
-            purchase.sum ??
-            purchase.amount
-        )
-      );
-    });
+    filteredPurchases.forEach(
+      (purchase) => {
+        purchasesTotal += Math.abs(
+          toNumber(
+            purchase.total ??
+              purchase.sum ??
+              purchase.amount,
+          ),
+        );
+      },
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -800,9 +868,7 @@ const paymentTotalFromSales =
     |--------------------------------------------------------------------------
     */
 
-    const returnsArray = Array.isArray(
-      returns
-    )
+    const returnsArray = Array.isArray(returns)
       ? returns
       : [];
 
@@ -811,15 +877,15 @@ const paymentTotalFromSales =
         const date = getDate(
           item.createdAt ||
             item.date ||
-            item.updatedAt
+            item.updatedAt,
         );
 
         return isDateInRange(
           date,
           range.from,
-          range.to
+          range.to,
         );
-      }
+      },
     );
 
     let returnsTotal = 0;
@@ -829,8 +895,8 @@ const paymentTotalFromSales =
         toNumber(
           item.total ??
             item.amount ??
-            item.sum
-        )
+            item.sum,
+        ),
       );
     });
 
@@ -844,10 +910,23 @@ const paymentTotalFromSales =
 
     filteredCashTransactions.forEach(
       (transaction) => {
+        /*
+        | Отменённая продажа
+        */
+        if (
+          transaction.type === "sale" &&
+          transaction.orderId &&
+          cancelledOrderIds.has(
+            String(transaction.orderId),
+          )
+        ) {
+          return;
+        }
+
         const date = getDate(
           transaction.createdAt ||
             transaction.date ||
-            transaction.updatedAt
+            transaction.updatedAt,
         );
 
         const day = getDayKey(date);
@@ -861,16 +940,51 @@ const paymentTotalFromSales =
         }
 
         const amount = Math.abs(
-          toNumber(transaction.amount)
+          toNumber(transaction.amount),
         );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Отменённая бронь
+        |--------------------------------------------------------------------------
+        */
+
+        if (transaction.type === "reservation") {
+          const reservationId =
+            getReservationIdFromTransaction(
+              transaction,
+            );
+
+          if (
+            reservationId &&
+            cancelledReservationIds.has(
+              String(reservationId),
+            )
+          ) {
+            /*
+            | Не показываем отменённую бронь
+            | в приходе за день.
+            |
+            | Но для net добавляем её обратно,
+            | потому что ниже refund будет вычтен.
+            */
+            dailyMap[day].net += amount;
+
+            return;
+          }
+
+          dailyMap[day].reservations += amount;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Остальные операции
+        |--------------------------------------------------------------------------
+        */
 
         switch (transaction.type) {
           case "sale":
             dailyMap[day].sales += amount;
-            break;
-
-          case "reservation":
-            dailyMap[day].reservations += amount;
             break;
 
           case "Rashod":
@@ -883,8 +997,7 @@ const paymentTotalFromSales =
             break;
 
           case "buyFromPostavshik":
-            dailyMap[day].supplierPayments +=
-              amount;
+            dailyMap[day].supplierPayments += amount;
             break;
 
           case "deposit":
@@ -899,6 +1012,12 @@ const paymentTotalFromSales =
             break;
         }
 
+        /*
+        |--------------------------------------------------------------------------
+        | NET
+        |--------------------------------------------------------------------------
+        */
+
         dailyMap[day].net =
           dailyMap[day].sales +
           dailyMap[day].reservations +
@@ -907,12 +1026,35 @@ const paymentTotalFromSales =
           dailyMap[day].returns -
           dailyMap[day].supplierPayments -
           dailyMap[day].withdraws;
-      }
+
+        /*
+        | Важно:
+        | если была отменённая бронь,
+        | её депозит добавляется отдельно в net.
+        */
+        if (
+          transaction.type === "reservation"
+        ) {
+          const reservationId =
+            getReservationIdFromTransaction(
+              transaction,
+            );
+
+          if (
+            reservationId &&
+            cancelledReservationIds.has(
+              String(reservationId),
+            )
+          ) {
+            dailyMap[day].net += amount;
+          }
+        }
+      },
     );
 
     const daily = Object.entries(dailyMap)
       .sort(([a], [b]) =>
-        a.localeCompare(b)
+        a.localeCompare(b),
       )
       .map(([date, values]) => ({
         date,
@@ -925,6 +1067,15 @@ const paymentTotalFromSales =
     |--------------------------------------------------------------------------
     */
 
+    /*
+    | Приход:
+    |
+    | Продажи
+    | +
+    | только действующие брони
+    |
+    | Отменённые брони сюда НЕ входят.
+    */
     const income =
       cashSales +
       cashReservations;
@@ -934,8 +1085,19 @@ const paymentTotalFromSales =
       cashReturns +
       supplierPayments;
 
+    /*
+    | Для netCashFlow учитываем реальные деньги.
+    |
+    | Если было:
+    | отменённая бронь +500
+    | возврат -500
+    |
+    | итог = 0.
+    */
     const netCashFlow =
-      income - outgoing;
+      income +
+      cancelledReservationDeposits -
+      outgoing;
 
     /*
     |--------------------------------------------------------------------------
@@ -947,16 +1109,28 @@ const paymentTotalFromSales =
       filteredCashTransactions
         .map((transaction) => ({
           id: transaction.id,
+
           type: transaction.type,
+
           amount: toNumber(
-            transaction.amount
+            transaction.amount,
           ),
+
           responsible:
             transaction.responsible || "",
+
           comment:
             transaction.comment || "",
+
           category:
             transaction.category || "",
+
+          reservationId:
+            transaction.reservationId ||
+            transaction.bookingId ||
+            transaction.reservation?.id ||
+            "",
+
           createdAt:
             transaction.createdAt ||
             transaction.date ||
@@ -965,7 +1139,7 @@ const paymentTotalFromSales =
         .sort(
           (a, b) =>
             new Date(b.createdAt) -
-            new Date(a.createdAt)
+            new Date(a.createdAt),
         );
 
     /*
@@ -991,6 +1165,23 @@ const paymentTotalFromSales =
       salesCount,
 
       salesByPayment,
+
+      reservationsTotal,
+
+      activeReservations:
+        filteredReservations.length,
+
+      cancelledReservations:
+        reservationsArray.length -
+        activeReservations.length,
+
+      cashReservations,
+
+      cancelledReservationDeposits,
+
+      income,
+
+      netCashFlow,
     });
 
     /*
@@ -1007,11 +1198,13 @@ const paymentTotalFromSales =
         to: to || null,
       },
 
-      balance: toNumber(
-        cash.balance
-      ),
+      balance: toNumber(cash.balance),
 
       summary: {
+        /*
+        | Только продажи + действующие брони.
+        | Отменённые брони здесь НЕ учитываются.
+        */
         income,
 
         expenses: totalExpenses,
@@ -1030,9 +1223,10 @@ const paymentTotalFromSales =
 
         salesCount,
 
-        reservations:
-          reservationsTotal ||
-          cashReservations,
+        /*
+        | Только действующие брони.
+        */
+        reservations: reservationsTotal,
 
         reservationsCount:
           filteredReservations.length,
@@ -1059,7 +1253,7 @@ const paymentTotalFromSales =
             value,
           }))
           .sort(
-            (a, b) => b.value - a.value
+            (a, b) => b.value - a.value,
           ),
 
       operationTypes:
@@ -1069,7 +1263,7 @@ const paymentTotalFromSales =
             value,
           }))
           .sort(
-            (a, b) => b.value - a.value
+            (a, b) => b.value - a.value,
           ),
 
       daily,
@@ -1089,9 +1283,7 @@ const paymentTotalFromSales =
         purchases:
           purchasesArray.length,
 
-        transfers: Array.isArray(
-          transfers
-        )
+        transfers: Array.isArray(transfers)
           ? transfers.length
           : 0,
 
@@ -1101,17 +1293,20 @@ const paymentTotalFromSales =
   } catch (error) {
     console.error(
       "REPORT ERROR:",
-      error
+      error,
     );
 
     res.status(500).json({
       success: false,
+
       message:
         "Не удалось сформировать отчёт",
+
       error: error.message,
     });
   }
 });
+
 /*
 |--------------------------------------------------------------------------
 | ROUTE: SEND REPORT TO TELEGRAM
@@ -1125,64 +1320,89 @@ router.post(
   upload.single("file"),
   async (req, res) => {
     try {
-      const botToken = process.env.TELEGRAM_BOT_TOKEN;
-      const chatId = process.env.TELEGRAM_CHAT_ID;
+      const botToken =
+        process.env.TELEGRAM_BOT_TOKEN;
+
+      const chatId =
+        process.env.TELEGRAM_CHAT_ID;
 
       if (!botToken) {
         return res.status(500).json({
           success: false,
-          message: "TELEGRAM_BOT_TOKEN не настроен",
+
+          message:
+            "TELEGRAM_BOT_TOKEN не настроен",
         });
       }
 
       if (!chatId) {
         return res.status(500).json({
           success: false,
-          message: "TELEGRAM_CHAT_ID не настроен",
+
+          message:
+            "TELEGRAM_CHAT_ID не настроен",
         });
       }
 
       if (!req.file) {
         return res.status(400).json({
           success: false,
-          message: "PDF-файл не передан",
+
+          message:
+            "PDF-файл не передан",
         });
       }
 
       const caption =
         req.body?.caption ||
-        `Отчёт кассы\n${new Date().toLocaleString("ru-RU")}`;
+        `Отчёт кассы\n${new Date().toLocaleString(
+          "ru-RU",
+        )}`;
 
       const formData = new FormData();
 
-      formData.append("chat_id", chatId);
-      formData.append("caption", caption);
+      formData.append(
+        "chat_id",
+        chatId,
+      );
+
+      formData.append(
+        "caption",
+        caption,
+      );
 
       const blob = new Blob(
         [req.file.buffer],
         {
-          type: req.file.mimetype || "application/pdf",
+          type:
+            req.file.mimetype ||
+            "application/pdf",
         },
       );
 
       formData.append(
         "document",
         blob,
-        req.file.originalname || "report.pdf",
+        req.file.originalname ||
+          "report.pdf",
       );
 
-      const telegramResponse = await fetch(
-        `https://api.telegram.org/bot${botToken}/sendDocument`,
-        {
-          method: "POST",
-          body: formData,
-        },
-      );
+      const telegramResponse =
+        await fetch(
+          `https://api.telegram.org/bot${botToken}/sendDocument`,
+          {
+            method: "POST",
+            body: formData,
+          },
+        );
 
       const telegramData =
         await telegramResponse.json();
 
-      if (!telegramResponse.ok || !telegramData.ok) {
+      if (
+        !telegramResponse.ok ||
+        !telegramData.ok
+      ) {
         console.error(
           "TELEGRAM ERROR:",
           telegramData,
@@ -1190,6 +1410,7 @@ router.post(
 
         return res.status(500).json({
           success: false,
+
           message:
             telegramData.description ||
             "Telegram не принял файл",
@@ -1198,7 +1419,9 @@ router.post(
 
       res.json({
         success: true,
-        message: "Отчёт отправлен в Telegram",
+
+        message:
+          "Отчёт отправлен в Telegram",
       });
     } catch (error) {
       console.error(
@@ -1208,13 +1431,16 @@ router.post(
 
       res.status(500).json({
         success: false,
+
         message:
           "Не удалось отправить отчёт в Telegram",
+
         error: error.message,
       });
     }
   },
 );
+
 /*
 |--------------------------------------------------------------------------
 | ROUTE: CLEAR ALL DATA
@@ -1223,66 +1449,84 @@ router.post(
 |--------------------------------------------------------------------------
 */
 
-router.delete("/clear", async (req, res) => {
-  try {
-    const files = [
-      "cash.json",
-      "expenses.json",
-      "sales.json",
-      "reservations.json",
-      "purchases.json",
-      "transfers.json",
-      "returns.json",
-    ];
+router.delete(
+  "/clear",
+  async (req, res) => {
+    try {
+      const files = [
+        "cash.json",
+        "expenses.json",
+        "sales.json",
+        "reservations.json",
+        "purchases.json",
+        "transfers.json",
+        "returns.json",
+      ];
 
-    const emptyData = {
-      "cash.json": {
-        balance: 0,
-        transactions: [],
-      },
+      const emptyData = {
+        "cash.json": {
+          balance: 0,
+          transactions: [],
+        },
 
-      "expenses.json": [],
+        "expenses.json": [],
 
-      "sales.json": [],
+        "sales.json": [],
 
-      "reservations.json": [],
+        "reservations.json": [],
 
-      "purchases.json": [],
+        "purchases.json": [],
 
-      "transfers.json": [],
+        "transfers.json": [],
 
-      "returns.json": [],
-    };
+        "returns.json": [],
+      };
 
-    for (const fileName of files) {
-      const filePath = path.join(DATA_DIR, fileName);
+      for (const fileName of files) {
+        const filePath = path.join(
+          DATA_DIR,
+          fileName,
+        );
 
-      await fs.writeFile(
-        filePath,
-        JSON.stringify(emptyData[fileName], null, 2),
-        "utf8"
+        await fs.writeFile(
+          filePath,
+          JSON.stringify(
+            emptyData[fileName],
+            null,
+            2,
+          ),
+          "utf8",
+        );
+      }
+
+      console.log(
+        "ВСЕ JSON-ДАННЫЕ ОЧИЩЕНЫ",
       );
+
+      res.json({
+        success: true,
+
+        message:
+          "Все данные успешно очищены",
+
+        files,
+      });
+    } catch (error) {
+      console.error(
+        "CLEAR DATA ERROR:",
+        error,
+      );
+
+      res.status(500).json({
+        success: false,
+
+        message:
+          "Не удалось очистить данные",
+
+        error: error.message,
+      });
     }
-
-    console.log("ВСЕ JSON-ДАННЫЕ ОЧИЩЕНЫ");
-
-    res.json({
-      success: true,
-      message: "Все данные успешно очищены",
-      files: files,
-    });
-  } catch (error) {
-    console.error(
-      "CLEAR DATA ERROR:",
-      error
-    );
-
-    res.status(500).json({
-      success: false,
-      message: "Не удалось очистить данные",
-      error: error.message,
-    });
-  }
-});
+  },
+);
 
 module.exports = router;
