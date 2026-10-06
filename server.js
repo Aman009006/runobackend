@@ -9,7 +9,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://runo-rouge.vercel.app"],
+    origin: ["http://localhost:3000","http://localhost:3001", "https://runo-rouge.vercel.app"],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -2422,7 +2422,7 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
         foundSale.orderId || foundSale.id,
         `CANCEL-${foundSale.id}`,
         foundSale.moyskladId,
-        true
+        true,
       );
 
       console.log(
@@ -2619,7 +2619,6 @@ app.post("/api/moysklad/returns", async (req, res) => {
       payment,
       storeId = YOUNG_GUARD_ID,
     } = req.body;
-
     console.log("================================");
     console.log("Создание РОЗНИЧНОГО ВОЗВРАТА");
     console.log("Товары:", items);
@@ -2628,302 +2627,233 @@ app.post("/api/moysklad/returns", async (req, res) => {
     console.log("Исходная продажа:", demandId);
     console.log("Оплата:", payment);
     console.log("Склад:", storeId);
-
-    /*
-     * ==========================================
-     * ПРОВЕРКА ТОВАРОВ
-     * ==========================================
-     */
-
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Нет товаров для возврата",
-      });
+    /* * ========================================== * ПРОВЕРКА ТОВАРОВ * ========================================== */ if (
+      !Array.isArray(items) ||
+      items.length === 0
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Нет товаров для возврата" });
     }
-
-    /*
-     * ==========================================
-     * ПРОВЕРКА КАССОВОЙ СМЕНЫ
-     * ==========================================
-     */
-
-    if (!retailShiftSyncId) {
-      return res.status(400).json({
-        success: false,
-        message: "Открытая кассовая смена не найдена",
-      });
+    /* * ========================================== * ПРОВЕРКА КАССОВОЙ СМЕНЫ * ========================================== */ if (
+      !retailShiftSyncId
+    ) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Открытая кассовая смена не найдена",
+        });
     }
-
-    /*
-     * ==========================================
-     * ПРОВЕРКА СУММЫ
-     * ==========================================
-     *
-     * total приходит с frontend в сомах.
-     *
-     * Например:
-     *
-     * total = 5000
-     *
-     * В МойСклад:
-     *
-     * 500000 копеек
-     */
-
-    if (!Number.isFinite(Number(total)) || Number(total) <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Некорректная сумма возврата",
-      });
+    /* * ========================================== * ПРОВЕРКА СУММЫ * ========================================== */ if (
+      !Number.isFinite(Number(total)) ||
+      Number(total) <= 0
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Некорректная сумма возврата" });
     }
-
     const normalizedTotal = Math.round(Number(total) * 100);
-
-    /*
-     * ==========================================
-     * ПРОВЕРКА СКЛАДА
-     * ==========================================
-     */
-
-    if (!storeId) {
-      return res.status(400).json({
-        success: false,
-        message: "Не указан склад",
-      });
+    /* * ========================================== * ПРОВЕРКА СКЛАДА * ========================================== */ if (
+      !storeId
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Не указан склад" });
     }
-
-    /*
-     * ==========================================
-     * ПРОВЕРКА РОЗНИЧНОЙ ТОЧКИ
-     * ==========================================
-     */
-
-    const retailStoreId = RETAIL_STORE_ID;
-
+    /* * ========================================== * ПРОВЕРКА РОЗНИЧНОЙ ТОЧКИ * ========================================== */ const retailStoreId =
+      RETAIL_STORE_ID;
     if (!retailStoreId) {
       throw new Error("MOYSKLAD_RETAIL_STORE_ID не указан в .env");
     }
-
-    /*
-     * ==========================================
-     * ПОЛУЧАЕМ ОРГАНИЗАЦИЮ
-     * ==========================================
-     */
-
-    const organization = await getMoySkladOrganization();
-
-    /*
-     * ==========================================
-     * ПРОВЕРЯЕМ КОНТРАГЕНТА
-     * ==========================================
-     */
-
-    if (!AGENT) {
+    /* * ========================================== * ПОЛУЧАЕМ ОРГАНИЗАЦИЮ * ========================================== */ const organization =
+      await getMoySkladOrganization();
+    /* * ========================================== * ПРОВЕРЯЕМ КОНТРАГЕНТА * ========================================== */ if (
+      !AGENT
+    ) {
       throw new Error("MOYSKLAD_AGENT не указан в .env");
     }
-
-    /*
-     * ==========================================
-     * НАХОДИМ РОЗНИЧНУЮ СМЕНУ
-     * ==========================================
-     */
-
-    const shiftFilter = encodeURIComponent(`syncId=${retailShiftSyncId}`);
-
+    /* * ========================================== * НАХОДИМ РОЗНИЧНУЮ СМЕНУ * ========================================== */ const shiftFilter =
+      encodeURIComponent(`syncId=${retailShiftSyncId}`);
     const shiftData = await moySkladRequest(
       `/entity/retailshift?filter=${shiftFilter}&limit=1`,
     );
-
     const retailShift = shiftData.rows?.[0];
-
     if (!retailShift) {
       throw new Error(
         `Розничная смена с syncId ${retailShiftSyncId} не найдена`,
       );
     }
-
-    /*
-     * ==========================================
-     * ФОРМИРУЕМ ПОЗИЦИИ ВОЗВРАТА
-     * ==========================================
-     */
-
-    const positions = items.map((item) => {
-      if (!item.id) {
-        throw new Error(
-          `У товара "${item.name || "Без названия"}" отсутствует ID МойСклад`,
+    /* * ========================================== * ОПРЕДЕЛЕНИЕ ТИПА АССОРТИМЕНТА * ========================================== * * Допустимые типы: * * product * bundle * * productfolder — это группа, НЕ ассортимент. * * Поэтому productfolder нельзя напрямую * передавать в positions.assortment. * * Backend сначала пытается использовать * указанный item.type, затем автоматически * проверяет product и bundle. */ const findAssortment =
+      async (item) => {
+        if (!item.id) {
+          throw new Error(
+            `У товара "${item.name || "Без названия"}" отсутствует ID МойСклад`,
+          );
+        }
+        /* * Типы, которые будем проверять. * * Если frontend передал корректный тип, * проверяем его первым. */ const requestedType =
+          typeof item.type === "string" ? item.type.toLowerCase() : null;
+        const typesToCheck = [];
+        if (requestedType === "product" || requestedType === "bundle") {
+          typesToCheck.push(requestedType);
+        }
+        /* * Если тип неизвестен или оказался неправильным, * автоматически пробуем оба типа. */ typesToCheck.push(
+          "product",
         );
-      }
-
+        typesToCheck.push("bundle");
+        const uniqueTypes = [...new Set(typesToCheck)];
+        /* * Проверяем каждый тип через API МойСклад. */ for (const type of uniqueTypes) {
+          try {
+            const object = await moySkladRequest(`/entity/${type}/${item.id}`, {
+              method: "GET",
+            });
+            if (object?.id) {
+              console.log(`Ассортимент найден: ${type}`, {
+                id: object.id,
+                name: object.name,
+              });
+              return { id: object.id, type, object };
+            }
+          } catch (checkError) {
+            const errorData =
+              checkError?.response?.data || checkError?.data || null;
+            const errorCode =
+              errorData?.errors?.[0]?.code ||
+              checkError?.response?.status ||
+              checkError?.status ||
+              null;
+            console.log(
+              `Не найден как ${type}: ${item.id}`,
+              errorCode || checkError.message,
+            );
+          }
+        }
+        /* * ========================================== * ЕСЛИ FRONTEND ПРИСЛАЛ PRODUCTFOLDER * ========================================== * * Группа товаров сама не может быть позицией * возврата. * * Но проверим, существует ли такая группа, * чтобы вернуть понятную ошибку. */ if (
+          requestedType === "productfolder"
+        ) {
+          try {
+            const folder = await moySkladRequest(
+              `/entity/productfolder/${item.id}`,
+              { method: "GET" },
+            );
+            if (folder?.id) {
+              throw new Error(
+                `Объект "${item.name || folder.name || "Без названия"}" ` +
+                  `является группой товаров (productfolder). ` +
+                  `Группу нельзя вернуть как отдельную позицию. ` +
+                  `Нужно передать ID конкретного товара или комплекта внутри группы.`,
+              );
+            }
+          } catch (folderError) {
+            /* * Если это наша понятная ошибка — * пробрасываем её дальше. */ if (
+              folderError.message &&
+              folderError.message.includes(
+                "Группу нельзя вернуть как отдельную позицию",
+              )
+            ) {
+              throw folderError;
+            }
+          }
+        }
+        /* * ========================================== * НЕ НАЙДЕНО * ========================================== */ throw new Error(
+          `Объект "${item.name || "Без названия"}" не найден в МойСклад. ` +
+            `ID: ${item.id}. ` +
+            `Тип из frontend: ${item.type || "не указан"}. ` +
+            `Ожидался product или bundle.`,
+        );
+      };
+    /* * ========================================== * ФОРМИРУЕМ ПОЗИЦИИ ВОЗВРАТА * ========================================== */ const positions =
+      [];
+    for (const item of items) {
       const quantity = Number(item.quantity);
-
       if (!Number.isFinite(quantity) || quantity <= 0) {
         throw new Error(`Некорректное количество товара "${item.name || ""}"`);
       }
-
-      const type = item.type || "product";
-
-      /*
-       * Цена приходит с frontend в сомах.
-       *
-       * МойСклад принимает цену в копейках.
-       */
-
-      const price = Math.round(Number(item.price || 0) * 100);
-
-      if (!Number.isFinite(price) || price < 0) {
+      /* * Цена приходит с frontend в сомах. * * МойСклад принимает цену в копейках. */ const priceSom =
+        Number(item.price || 0);
+      if (!Number.isFinite(priceSom) || priceSom < 0) {
         throw new Error(`Некорректная цена товара "${item.name || ""}"`);
       }
-
-      return {
+      const price = Math.round(priceSom * 100);
+      /* * Автоматически определяем, * product это или bundle. */ const assortment =
+        await findAssortment(item);
+      console.log("Позиция возврата:", {
+        id: item.id,
+        name: item.name,
+        frontendType: item.type || null,
+        moySkladType: assortment.type,
         quantity,
-
+        priceSom,
+      });
+      positions.push({
+        quantity,
         price,
-
         assortment: {
           meta: {
-            href: `${MOYSKLAD_API}/entity/${type}/${item.id}`,
-
-            type,
-
+            href: `${MOYSKLAD_API}/entity/${assortment.type}/${assortment.id}`,
+            type: assortment.type,
             mediaType: "application/json",
           },
         },
+      });
+    }
+    /* * ========================================== * НОМЕР ВОЗВРАТА * ========================================== */ const returnId = `RETURN-${Date.now()}`;
+    /* * ========================================== * ДАННЫЕ ВОЗВРАТА * ========================================== */ const retailSalesReturnData =
+      {
+        name: returnId,
+        moment: new Date().toISOString().slice(0, 19).replace("T", " "),
+        description: `POS возврат${orderId ? `: ${orderId}` : ""}`,
+        /* * Организация */ organization: {
+          meta: {
+            href: organization.meta.href,
+            type: "organization",
+            mediaType: "application/json",
+          },
+        },
+        /* * Контрагент */ agent: {
+          meta: {
+            href: `${MOYSKLAD_API}/entity/counterparty/${AGENT}`,
+            type: "counterparty",
+            mediaType: "application/json",
+          },
+        },
+        /* * Розничная точка */ retailStore: {
+          meta: {
+            href: `${MOYSKLAD_API}/entity/retailstore/${retailStoreId}`,
+            type: "retailstore",
+            mediaType: "application/json",
+          },
+        },
+        /* * Склад */ store: {
+          meta: {
+            href: `${MOYSKLAD_API}/entity/store/${storeId}`,
+            type: "store",
+            mediaType: "application/json",
+          },
+        },
+        /* * Розничная смена */ retailShift: {
+          meta: {
+            href: `${MOYSKLAD_API}/entity/retailshift/${retailShift.id}`,
+            type: "retailshift",
+            mediaType: "application/json",
+          },
+        },
+        positions,
       };
-    });
-
-    /*
-     * ==========================================
-     * НОМЕР ВОЗВРАТА
-     * ==========================================
-     */
-
-    const returnId = `RETURN-${Date.now()}`;
-
-    /*
-     * ==========================================
-     * ДАННЫЕ ВОЗВРАТА
-     * ==========================================
-     */
-
-    const retailSalesReturnData = {
-      name: returnId,
-
-      moment: new Date().toISOString().slice(0, 19).replace("T", " "),
-
-      description: `POS возврат${orderId ? `: ${orderId}` : ""}`,
-
-      /*
-       * Организация
-       */
-      organization: {
-        meta: {
-          href: organization.meta.href,
-
-          type: "organization",
-
-          mediaType: "application/json",
-        },
-      },
-
-      /*
-       * Контрагент
-       */
-      agent: {
-        meta: {
-          href: `${MOYSKLAD_API}/entity/counterparty/${AGENT}`,
-
-          type: "counterparty",
-
-          mediaType: "application/json",
-        },
-      },
-
-      /*
-       * Розничная точка
-       */
-      retailStore: {
-        meta: {
-          href: `${MOYSKLAD_API}/entity/retailstore/${retailStoreId}`,
-
-          type: "retailstore",
-
-          mediaType: "application/json",
-        },
-      },
-
-      /*
-       * Склад
-       */
-      store: {
-        meta: {
-          href: `${MOYSKLAD_API}/entity/store/${storeId}`,
-
-          type: "store",
-
-          mediaType: "application/json",
-        },
-      },
-
-      /*
-       * Розничная смена
-       */
-      retailShift: {
-        meta: {
-          href: `${MOYSKLAD_API}/entity/retailshift/${retailShift.id}`,
-
-          type: "retailshift",
-
-          mediaType: "application/json",
-        },
-      },
-
-      positions,
-    };
-
-    /*
-     * ==========================================
-     * СВЯЗЬ С ИСХОДНОЙ ПРОДАЖЕЙ
-     * ==========================================
-     */
-
-    if (demandId) {
+    /* * ========================================== * СВЯЗЬ С ИСХОДНОЙ ПРОДАЖЕЙ * ========================================== */ if (
+      demandId
+    ) {
       retailSalesReturnData.demand = {
         meta: {
           href: `${MOYSKLAD_API}/entity/retaildemand/${demandId}`,
-
           type: "retaildemand",
-
           mediaType: "application/json",
         },
       };
     }
-
-    /*
-     * ==========================================
-     * ОПЛАТА ВОЗВРАТА
-     * ==========================================
-     *
-     * Frontend:
-     *
-     * cash = сомы
-     * card = сомы
-     *
-     * МойСклад:
-     *
-     * cashSum = копейки
-     * noCashSum = копейки
-     */
-
-    const cash = Number(payment?.cash || 0);
-
+    /* * ========================================== * ОПЛАТА ВОЗВРАТА * ========================================== */ const cash =
+      Number(payment?.cash || 0);
     const card = Number(payment?.card || 0);
-
-    /*
-     * Проверяем суммы
-     */
-
     if (
       !Number.isFinite(cash) ||
       !Number.isFinite(card) ||
@@ -2932,32 +2862,15 @@ app.post("/api/moysklad/returns", async (req, res) => {
     ) {
       throw new Error("Некорректные суммы возврата");
     }
-
-    /*
-     * Конвертируем в копейки
-     */
-
-    const cashSum = Math.round(cash * 100);
-
+    /* * ========================================== * КОНВЕРТАЦИЯ В КОПЕЙКИ * ========================================== */ const cashSum =
+      Math.round(cash * 100);
     const noCashSum = Math.round(card * 100);
-
-    /*
-     * ==========================================
-     * ЕСЛИ PAYMENT НЕ ПЕРЕДАН
-     * ==========================================
-     *
-     * Считаем возврат полностью наличным.
-     */
-
-    if (!payment) {
+    /* * ========================================== * ЕСЛИ PAYMENT НЕ ПЕРЕДАН * ========================================== */ if (
+      !payment
+    ) {
       retailSalesReturnData.cashSum = normalizedTotal;
-
       retailSalesReturnData.noCashSum = 0;
     } else {
-      /*
-       * Проверяем совпадение суммы
-       */
-
       if (cashSum + noCashSum !== normalizedTotal) {
         throw new Error(
           `Сумма возврата не совпадает: ` +
@@ -2966,60 +2879,30 @@ app.post("/api/moysklad/returns", async (req, res) => {
             `total=${normalizedTotal}`,
         );
       }
-
       retailSalesReturnData.cashSum = cashSum;
-
       retailSalesReturnData.noCashSum = noCashSum;
     }
-
-    /*
-     * ==========================================
-     * ОПРЕДЕЛЯЕМ СУММУ ДЛЯ ЛОКАЛЬНОЙ КАССЫ
-     * ==========================================
-     *
-     * Только наличные уменьшают cash.json.
-     */
-
-    const localCashSum = payment ? cashSum : normalizedTotal;
-
+    /* * ========================================== * СУММА ДЛЯ ЛОКАЛЬНОЙ КАССЫ * ========================================== */ const localCashSum =
+      payment ? cashSum : normalizedTotal;
     console.log(
       "Сумма возврата наличными для cash.json:",
       localCashSum / 100,
       "сом",
     );
-
-    /*
-     * ==========================================
-     * СОЗДАЁМ ВОЗВРАТ В МОЙСКЛАД
-     * ==========================================
-     */
-
-    console.log(
+    /* * ========================================== * СОЗДАЁМ ВОЗВРАТ В МОЙСКЛАД * ========================================== */ console.log(
       "ВОЗВРАТ JSON:",
       JSON.stringify(retailSalesReturnData, null, 2),
     );
-
     const retailSalesReturn = await moySkladRequest(
       "/entity/retailsalesreturn",
       {
         method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-        },
-
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(retailSalesReturnData),
       },
     );
-
-    /*
-     * ==========================================
-     * СПИСЫВАЕМ ДЕНЬГИ ИЗ ЛОКАЛЬНОЙ КАССЫ
-     * ==========================================
-     */
-
-    let cashTransaction = null;
-
+    /* * ========================================== * СПИСЫВАЕМ ДЕНЬГИ ИЗ ЛОКАЛЬНОЙ КАССЫ * ========================================== */ let cashTransaction =
+      null;
     if (localCashSum > 0) {
       cashTransaction = addReturnToCash(
         localCashSum,
@@ -3027,206 +2910,98 @@ app.post("/api/moysklad/returns", async (req, res) => {
         returnId,
         retailSalesReturn?.id || null,
       );
-
       console.log("Деньги за возврат списаны из кассы:", cashTransaction);
     } else {
       console.log("Возврат без наличных — cash.json не изменяется");
     }
-
-    /*
-     * ==========================================
-     * СОХРАНЯЕМ ВОЗВРАТ В data/returns.json
-     * ==========================================
-     */
-
-    // const DATA_DIR = path.join(__dirname, "data");
-    const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
-
-    /*
-     * Создаём data, если папки нет
-     */
-
+    /* * ========================================== * СОХРАНЯЕМ В data/returns.json * ========================================== */ const RETURNS_FILE =
+      path.join(DATA_DIR, "returns.json");
     if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, {
-        recursive: true,
-      });
+      fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-
-    /*
-     * Читаем существующие возвраты
-     */
-
-    let returns = [];
-
+    /* * Читаем существующие возвраты */ let returns = [];
     if (fs.existsSync(RETURNS_FILE)) {
       try {
         const fileData = fs.readFileSync(RETURNS_FILE, "utf8");
-
         if (fileData.trim()) {
           returns = JSON.parse(fileData);
         }
-
         if (!Array.isArray(returns)) {
           returns = [];
         }
       } catch (fileError) {
         console.error("Ошибка чтения returns.json:", fileError);
-
         returns = [];
       }
     }
-
-    /*
-     * ==========================================
-     * СОЗДАЁМ ЛОКАЛЬНУЮ ЗАПИСЬ
-     * ==========================================
-     *
-     * Здесь суммы хранятся в СОМАХ,
-     * чтобы frontend мог сразу использовать их.
-     */
-
-    const returnRecord = {
-      id: returnId,
-
-      name: returnId,
-
-      date: new Date().toISOString(),
-
-      orderId: orderId || null,
-
-      demandId: demandId || null,
-
-      returnDocumentId: retailSalesReturn?.id || null,
-
-      retailShiftSyncId,
-
-      retailShiftId: retailShift.id,
-
-      storeId,
-
-      total: Number(total),
-
-      payment: {
-        cash,
-        card,
+    /* * ========================================== * СОЗДАЁМ ЛОКАЛЬНУЮ ЗАПИСЬ * ========================================== */ const returnRecord =
+      {
+        id: returnId,
+        name: returnId,
+        date: new Date().toISOString(),
+        orderId: orderId || null,
+        demandId: demandId || null,
+        returnDocumentId: retailSalesReturn?.id || null,
+        retailShiftSyncId,
+        retailShiftId: retailShift.id,
+        storeId,
+        total: Number(total),
+        payment: { cash, card },
+        cashSum: localCashSum / 100,
+        noCashSum: payment ? noCashSum / 100 : 0,
+        items: items.map((item) => {
+          const quantity = Number(item.quantity);
+          const price = Number(item.price || 0);
+          return {
+            id: item.id,
+            name: item.name || "Без названия",
+            /* * Сохраняем тип, который * пришёл с frontend. * * Если его не было — * определяем по позиции. */ type:
+              item.type || "product",
+            quantity,
+            price,
+            sum: price * quantity,
+          };
+        }),
+      };
+    /* * Добавляем новый возврат */ returns.push(returnRecord);
+    /* * ========================================== * СОРТИРОВКА ПО ДАТЕ * ========================================== */ returns.sort(
+      (a, b) => {
+        return new Date(b.date).getTime() - new Date(a.date).getTime();
       },
-
-      cashSum: localCashSum / 100,
-
-      noCashSum: payment ? noCashSum / 100 : 0,
-
-      items: items.map((item) => {
-        const quantity = Number(item.quantity);
-
-        const price = Number(item.price || 0);
-
-        return {
-          id: item.id,
-
-          name: item.name || "Без названия",
-
-          type: item.type || "product",
-
-          quantity,
-
-          price,
-
-          sum: price * quantity,
-        };
-      }),
-    };
-
-    /*
-     * Добавляем новый возврат
-     */
-
-    returns.push(returnRecord);
-
-    /*
-     * ==========================================
-     * СОРТИРОВКА ПО ДАТЕ
-     * ==========================================
-     *
-     * Новые возвраты сверху.
-     */
-
-    returns.sort((a, b) => {
-      return new Date(b.date).getTime() - new Date(a.date).getTime();
-    });
-
-    /*
-     * ==========================================
-     * СОХРАНЯЕМ returns.json
-     * ==========================================
-     */
-
-    fs.writeFileSync(RETURNS_FILE, JSON.stringify(returns, null, 2), "utf8");
-
+    );
+    /* * ========================================== * СОХРАНЯЕМ returns.json * ========================================== */ fs.writeFileSync(
+      RETURNS_FILE,
+      JSON.stringify(returns, null, 2),
+      "utf8",
+    );
     console.log("Возврат сохранён в returns.json:", returnRecord);
-
-    /*
-     * ==========================================
-     * УСПЕШНЫЙ ОТВЕТ
-     * ==========================================
-     */
-
-    return res.status(201).json({
-      success: true,
-
-      returnId,
-
-      returnDocumentId: retailSalesReturn?.id || null,
-
-      /*
-       * Общая сумма в копейках
-       */
-      total: normalizedTotal,
-
-      /*
-       * Наличные в копейках
-       */
-      cashSum: localCashSum,
-
-      /*
-       * Безналичные в копейках
-       */
-      noCashSum: payment ? noCashSum : 0,
-
-      retailShiftSyncId,
-
-      retailShiftId: retailShift.id,
-
-      /*
-       * Локальная операция с кассой
-       */
-      cashTransaction,
-
-      /*
-       * Локальная запись возврата
-       */
-      returnRecord,
-
-      retailSalesReturn,
-    });
+    /* * ========================================== * УСПЕШНЫЙ ОТВЕТ * ========================================== */ return res
+      .status(201)
+      .json({
+        success: true,
+        returnId,
+        returnDocumentId: retailSalesReturn?.id || null,
+        /* * Общая сумма в копейках */ total: normalizedTotal,
+        /* * Наличные в копейках */ cashSum: localCashSum,
+        /* * Безналичные в копейках */ noCashSum: payment ? noCashSum : 0,
+        retailShiftSyncId,
+        retailShiftId: retailShift.id,
+        /* * Локальная операция * с кассой */ cashTransaction,
+        /* * Локальная запись * возврата */ returnRecord,
+        retailSalesReturn,
+      });
   } catch (error) {
     console.error("Ошибка создания розничного возврата:", error);
-
-    /*
-     * Если ошибка пришла от МойСклад,
-     * показываем её максимально подробно.
-     */
-
-    const moySkladError = error?.response?.data || error?.data;
-
+    /* * Если ошибка пришла * от МойСклад, * показываем её подробно. */ const moySkladError =
+      error?.response?.data || error?.data;
     console.error("Детали ошибки МойСклад:", moySkladError);
-
-    return res.status(500).json({
-      success: false,
-
-      message: error.message || "Ошибка создания розничного возврата",
-
-      moySkladError: moySkladError || null,
-    });
+    return res
+      .status(500)
+      .json({
+        success: false,
+        message: error.message || "Ошибка создания розничного возврата",
+        moySkladError: moySkladError || null,
+      });
   }
 });
 
