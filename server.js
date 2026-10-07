@@ -16,11 +16,15 @@ app.use(
 );
 
 app.use(express.json());
+const writeoffRouter = require("./writeoff.routes");
+const personnelRouter = require("./personnel");
 
 const expensesRouter = require("./expenses");
 const amanatRoutes = require("./amanat");
 
 app.use("/api/expenses", expensesRouter);
+app.use("/api/moysklad", writeoffRouter);
+app.use("/api", personnelRouter);
 
 const transfersRoutes = require("./transfers");
 
@@ -58,6 +62,7 @@ const reservationsRouter = require("./reservations.routes");
 const DATA_DIR = path.join(__dirname, "..", "data");
 const SALES_FILE = path.join(DATA_DIR, "sales.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
+const SALESPERSONS_FILE = path.join(DATA_DIR, "personnel.json");
 const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
 
 // Создаем папку data
@@ -104,7 +109,36 @@ function readSales() {
     return {};
   }
 }
+// =========================================================
+// READ SALESPERSONS
+// =========================================================
 
+function readSalespersons() {
+  try {
+    if (!fs.existsSync(SALESPERSONS_FILE)) {
+      return [];
+    }
+
+    const content = fs.readFileSync(SALESPERSONS_FILE, "utf8");
+
+    if (!content.trim()) {
+      return [];
+    }
+
+    const salespersons = JSON.parse(content);
+
+    if (!Array.isArray(salespersons)) {
+      console.error("personnel.json должен содержать массив продавцов");
+      return [];
+    }
+
+    return salespersons;
+  } catch (error) {
+    console.error("Ошибка чтения personnel.json:", error);
+
+    return [];
+  }
+}
 // =========================================================
 // WRITE SALES
 // =========================================================
@@ -2525,7 +2559,11 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
       });
     }
 
-    const salesperson = SALESPERSONS.find((item) => item.id === salespersonId);
+   const salespersons = readSalespersons();
+
+const salesperson = salespersons.find(
+  (item) => String(item.id) === String(salespersonId),
+);
 
     if (!salesperson) {
       return res.status(404).json({
@@ -3015,67 +3053,22 @@ app.post("/api/moysklad/returns", async (req, res) => {
  * id должен быть уникальным.
  */
 
-const SALESPERSONS = [
-  {
-    id: "seller001",
-    name: "Айсырга",
-  },
-  {
-    id: "seller002",
-    name: "Айжамал",
-  },
-  {
-    id: "seller003",
-    name: "Турсунай",
-  },
-  {
-    id: "seller004",
-    name: "Рапия",
-  },
-  {
-    id: "seller005",
-    name: "Камила",
-  },
-  {
-    id: "seller006",
-    name: "Зинаида",
-  },
-  {
-    id: "seller007",
-    name: "Мээрим",
-  },
-  {
-    id: "seller008",
-    name: "Перизат",
-  },
-  {
-    id: "seller009",
-    name: "Сайрагуль",
-  },
-  {
-    id: "seller010",
-    name: "Назик",
-  },
-  {
-    id: "seller011",
-    name: "Бермет",
-  },
-  {
-    id: "seller012",
-    name: "Аида",
-  },
-  {
-    id: "seller013",
-    name: "Малика",
-  },
-  {
-    id: "seller014",
-    name: "Сезим",
-  },
-];
 
 app.get("/api/moysklad/salespersons", (req, res) => {
-  res.json({
-    salespersons: SALESPERSONS,
-  });
+  try {
+    const salespersons = readSalespersons();
+
+    return res.json({
+      success: true,
+      salespersons,
+    });
+  } catch (error) {
+    console.error("Ошибка получения продавцов:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Не удалось получить список продавцов",
+      salespersons: [],
+    });
+  }
 });
