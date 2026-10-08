@@ -3,6 +3,8 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 
+const { getCurrentBranch } = require("./branchContext");
+
 const router = express.Router();
 
 /*
@@ -11,16 +13,9 @@ const router = express.Router();
 |--------------------------------------------------------------------------
 */
 
-const DATA_DIR = path.join(
-  __dirname,
-  "..",
-  "data"
-);
+const DATA_DIR = path.join(__dirname, "..", "data");
 
-const PERSONNEL_FILE = path.join(
-  DATA_DIR,
-  "personnel.json"
-);
+const PERSONNEL_FILE = path.join(DATA_DIR, "personnel.json");
 
 /*
 |--------------------------------------------------------------------------
@@ -28,55 +23,124 @@ const PERSONNEL_FILE = path.join(
 |--------------------------------------------------------------------------
 */
 
-async function readPersonnel() {
+/**
+ * Получить ключ текущего филиала.
+ *
+ * Ожидается, что getCurrentBranch() возвращает что-то вроде:
+ *
+ * {
+ *   id: "bishkek",
+ *   ...
+ * }
+ *
+ * или:
+ *
+ * {
+ *   id: "dordoy",
+ *   ...
+ * }
+ */
+function getBranchKey() {
+  const branch = getCurrentBranch();
+
+  if (!branch?.id) {
+    throw new Error("Текущий филиал не определён.");
+  }
+
+  return String(branch.id).trim().toLowerCase();
+}
+
+/**
+ * Прочитать весь personnel.json
+ *
+ * Формат:
+ *
+ * {
+ *   "bishkek": [],
+ *   "dordoy": [],
+ *   "osh": []
+ * }
+ */
+async function readPersonnelData() {
   try {
-    const data = await fs.readFile(
-      PERSONNEL_FILE,
-      "utf8"
-    );
+    const data = await fs.readFile(PERSONNEL_FILE, "utf8");
 
     if (!data.trim()) {
-      return [];
+      return {};
     }
 
     const parsed = JSON.parse(data);
 
-    return Array.isArray(parsed)
-      ? parsed
-      : [];
+    /*
+     * Защита от старого формата:
+     *
+     * [
+     *   { id: "...", name: "..." }
+     * ]
+     *
+     * Если вдруг старый JSON ещё остался,
+     * не ломаем приложение.
+     */
+    if (Array.isArray(parsed)) {
+      return {
+        bishkek: parsed,
+      };
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+
+    return parsed;
   } catch (error) {
     if (error.code === "ENOENT") {
       await fs.mkdir(DATA_DIR, {
         recursive: true,
       });
 
+      const emptyData = {
+        bishkek: [],
+        dordoy: [],
+        osh: [],
+      };
+
       await fs.writeFile(
         PERSONNEL_FILE,
-        "[]",
-        "utf8"
+        JSON.stringify(emptyData, null, 2),
+        "utf8",
       );
 
-      return [];
+      return emptyData;
     }
 
     throw error;
   }
 }
 
-async function savePersonnel(personnel) {
+/**
+ * Сохранить весь personnel.json
+ */
+async function savePersonnelData(data) {
   await fs.mkdir(DATA_DIR, {
     recursive: true,
   });
 
-  await fs.writeFile(
-    PERSONNEL_FILE,
-    JSON.stringify(
-      personnel,
-      null,
-      2
-    ),
-    "utf8"
-  );
+  await fs.writeFile(PERSONNEL_FILE, JSON.stringify(data, null, 2), "utf8");
+}
+
+/**
+ * Получить сотрудников текущего филиала
+ */
+async function readPersonnel() {
+  const branchKey = getBranchKey();
+
+  const data = await readPersonnelData();
+
+  if (!Array.isArray(data[branchKey])) {
+    data[branchKey] = [];
+  }
+
+  return data[branchKey];
 }
 
 /*
@@ -84,35 +148,36 @@ async function savePersonnel(personnel) {
 | GET /api/personnel
 |--------------------------------------------------------------------------
 |
-| Получить весь персонал
+| Получить персонал текущего филиала
 |
 */
 
-router.get(
-  "/personnel",
-  async (req, res) => {
-    try {
-      const personnel =
-        await readPersonnel();
+router.get("/personnel", async (req, res) => {
+  try {
+    const branchKey = getBranchKey();
 
-      return res.json({
-        success: true,
-        personnel,
-      });
-    } catch (error) {
-      console.error(
-        "Ошибка получения персонала:",
-        error
-      );
+    const data = await readPersonnelData();
 
-      return res.status(500).json({
-        success: false,
-        message:
-          "Не удалось получить персонал.",
-      });
+    if (!Array.isArray(data[branchKey])) {
+      data[branchKey] = [];
+
+      await savePersonnelData(data);
     }
+
+    return res.json({
+      success: true,
+      branch: branchKey,
+      personnel: data[branchKey],
+    });
+  } catch (error) {
+    console.error("Ошибка получения персонала:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось получить персонал.",
+    });
   }
-);
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -129,86 +194,85 @@ router.get(
 |
 */
 
-router.post(
-  "/personnel",
-  async (req, res) => {
-    try {
-      const name = String(
-        req.body?.name || ""
-      ).trim();
+router.post("/personnel", async (req, res) => {
+  try {
+    const branchKey = getBranchKey();
 
-      if (!name) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Введите имя сотрудника.",
-        });
-      }
+    const name = String(req.body?.name || "").trim();
 
-      const personnel =
-        await readPersonnel();
-
-      /*
-       * Не разрешаем добавить
-       * одинаковое имя.
-       */
-
-      const alreadyExists =
-        personnel.some(
-          (person) =>
-            String(
-              person.name || ""
-            )
-              .trim()
-              .toLowerCase() ===
-            name.toLowerCase()
-        );
-
-      if (alreadyExists) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "Сотрудник с таким именем уже существует.",
-        });
-      }
-
-      /*
-       * Генерируем ID.
-       */
-
-      const person = {
-        id:
-          `seller_${crypto.randomUUID()}`,
-        name,
-      };
-
-      personnel.push(person);
-
-      await savePersonnel(
-        personnel
-      );
-
-      return res.status(201).json({
-        success: true,
-        message:
-          "Сотрудник успешно добавлен.",
-        person,
-        personnel,
-      });
-    } catch (error) {
-      console.error(
-        "Ошибка добавления персонала:",
-        error
-      );
-
-      return res.status(500).json({
+    if (!name) {
+      return res.status(400).json({
         success: false,
-        message:
-          "Не удалось добавить сотрудника.",
+        message: "Введите имя сотрудника.",
       });
     }
+
+    const data = await readPersonnelData();
+
+    /*
+     * Если филиала ещё нет
+     * в JSON — создаём его.
+     */
+
+    if (!Array.isArray(data[branchKey])) {
+      data[branchKey] = [];
+    }
+
+    const personnel = data[branchKey];
+
+    /*
+     * Не разрешаем добавить
+     * одинаковое имя в одном филиале.
+     */
+
+    const alreadyExists = personnel.some(
+      (person) =>
+        String(person.name || "")
+          .trim()
+          .toLowerCase() === name.toLowerCase(),
+    );
+
+    if (alreadyExists) {
+      return res.status(409).json({
+        success: false,
+        message: "Сотрудник с таким именем уже существует.",
+      });
+    }
+
+    /*
+     * Генерируем ID.
+     */
+
+    const person = {
+      id: `seller_${crypto.randomUUID()}`,
+      name,
+    };
+
+    /*
+     * Добавляем сотрудника
+     * только в текущий филиал.
+     */
+
+    data[branchKey].push(person);
+
+    await savePersonnelData(data);
+
+    return res.status(201).json({
+      success: true,
+      message: "Сотрудник успешно добавлен.",
+      branch: branchKey,
+      person,
+      personnel: data[branchKey],
+    });
+  } catch (error) {
+    console.error("Ошибка добавления персонала:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось добавить сотрудника.",
+    });
   }
-);
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -219,68 +283,66 @@ router.post(
 |
 */
 
-router.delete(
-  "/personnel/:id",
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+router.delete("/personnel/:id", async (req, res) => {
+  try {
+    const branchKey = getBranchKey();
 
-      if (!id) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Не указан ID сотрудника.",
-        });
-      }
+    const { id } = req.params;
 
-      const personnel =
-        await readPersonnel();
-
-      const person =
-        personnel.find(
-          (item) =>
-            item.id === id
-        );
-
-      if (!person) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Сотрудник не найден.",
-        });
-      }
-
-      const newPersonnel =
-        personnel.filter(
-          (item) =>
-            item.id !== id
-        );
-
-      await savePersonnel(
-        newPersonnel
-      );
-
-      return res.json({
-        success: true,
-        message:
-          "Сотрудник успешно удалён.",
-        deletedId: id,
-        personnel:
-          newPersonnel,
-      });
-    } catch (error) {
-      console.error(
-        "Ошибка удаления персонала:",
-        error
-      );
-
-      return res.status(500).json({
+    if (!id) {
+      return res.status(400).json({
         success: false,
-        message:
-          "Не удалось удалить сотрудника.",
+        message: "Не указан ID сотрудника.",
       });
     }
+
+    const data = await readPersonnelData();
+
+    /*
+     * Если текущего филиала нет,
+     * сотрудника соответственно тоже нет.
+     */
+
+    if (!Array.isArray(data[branchKey])) {
+      data[branchKey] = [];
+    }
+
+    const personnel = data[branchKey];
+
+    const person = personnel.find((item) => item.id === id);
+
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        message: "Сотрудник не найден.",
+      });
+    }
+
+    /*
+     * Удаляем только из текущего филиала.
+     */
+
+    const newPersonnel = personnel.filter((item) => item.id !== id);
+
+    data[branchKey] = newPersonnel;
+
+    await savePersonnelData(data);
+
+    return res.json({
+      success: true,
+      message: "Сотрудник успешно удалён.",
+      branch: branchKey,
+      deletedId: id,
+      personnel: newPersonnel,
+    });
+  } catch (error) {
+    console.error("Ошибка удаления персонала:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось удалить сотрудника.",
+    });
   }
-);
+});
 
 module.exports = router;
