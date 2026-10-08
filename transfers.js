@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const { getCurrentBranch } = require("./branchContext");
 
 const router = express.Router();
 
@@ -8,23 +9,94 @@ const MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2";
 
 const LOGIN = process.env.MOYSKLAD_LOGIN;
 const PASSWORD = process.env.MOYSKLAD_PASSWORD;
-
 const AGENT_ID = process.env.MOYSKLAD_AGENT;
 
-// Это ID именно розничной точки / кассы.
-// Для перемещений он НЕ используется.
+// ID розничной точки / кассы.
+// Для перемещений между складами НЕ используется.
 const RETAIL_STORE_ID = process.env.MOYSKLAD_RETAIL_STORE_ID;
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const TRANSFERS_FILE = path.join(DATA_DIR, "transfers.json");
 const CASH_FILE = path.join(DATA_DIR, "cash.json");
 
+const BRANCH_KEYS = ["bishkek", "dordoy", "osh"];
+
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-if (!fs.existsSync(TRANSFERS_FILE)) {
-  fs.writeFileSync(TRANSFERS_FILE, JSON.stringify([], null, 2), "utf8");
+/**
+ * ----------------------------------------------------
+ * BRANCH HELPERS
+ * ----------------------------------------------------
+ */
+
+function getBranchKey(branch = getCurrentBranch()) {
+  const value =
+    branch?.key ||
+    branch?.code ||
+    branch?.slug ||
+    branch?.branchKey ||
+    branch?.id ||
+    branch?.name;
+
+  if (!value) {
+    throw new Error("Не удалось определить текущий филиал");
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (BRANCH_KEYS.includes(normalized)) {
+    return normalized;
+  }
+
+  /**
+   * Если branchContext использует русские названия,
+   * поддерживаем их тоже.
+   */
+
+  if (normalized.includes("бишкек") || normalized.includes("bishkek")) {
+    return "bishkek";
+  }
+
+  if (
+    normalized.includes("дордой") ||
+    normalized.includes("dordoy") ||
+    normalized.includes("dordoi")
+  ) {
+    return "dordoy";
+  }
+
+  if (normalized.includes("ош") || normalized === "osh") {
+    return "osh";
+  }
+
+  throw new Error(
+    `Неизвестный филиал: ${value}. Ожидается bishkek, dordoy или osh.`,
+  );
+}
+
+function createEmptyCashBranch() {
+  return {
+    balance: 0,
+    transactions: [],
+  };
+}
+
+function createEmptyCashStorage() {
+  return {
+    bishkek: createEmptyCashBranch(),
+    dordoy: createEmptyCashBranch(),
+    osh: createEmptyCashBranch(),
+  };
+}
+
+function createEmptyTransfersStorage() {
+  return {
+    bishkek: [],
+    dordoy: [],
+    osh: [],
+  };
 }
 
 /**
@@ -46,6 +118,7 @@ function getAuthHeader() {
 async function moyskladRequest(endpoint, options = {}) {
   const response = await fetch(`${MOYSKLAD_API}${endpoint}`, {
     ...options,
+
     headers: {
       Accept: "application/json;charset=utf-8",
       "Content-Type": "application/json",
@@ -106,71 +179,416 @@ function getMeta(entity, id) {
   };
 }
 
+async function getMoySkladMoves() {
+  const data = await moyskladRequest(
+    "/entity/move?limit=100&expand=sourceStore,targetStore,positions.assortment",
+  );
+
+  return Array.isArray(data?.rows) ? data.rows : [];
+}
+async function createShortageLoss({
+  storeId,
+  organizationId,
+  items,
+  transferId,
+}) {
+  const shortageItems = items.filter(
+    (item) => Number(item.shortageQuantity || 0) > 0,
+  );
+
+  if (shortageItems.length === 0) {
+    return null;
+  }
+
+  const positions = shortageItems.map((item) => {
+    const quantity = Number(item.shortageQuantity);
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error(`Некорректная недостача для товара "${item.name}"`);
+    }
+
+    if (!item.assortmentId) {
+      throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
+    }
+
+    const assortmentType =
+      item.assortmentMeta?.type || item.assortmentMeta?.meta?.type || "product";
+
+    if (!["product", "variant", "bundle", "service"].includes(assortmentType)) {
+      throw new Error(
+        `Неподдерживаемый тип товара "${assortmentType}" для "${item.name}"`,
+      );
+    }
+
+    return {
+      quantity,
+
+      reason: `Недостача при приемке перемещения ${transferId}`,
+
+      assortment: getMeta(assortmentType, item.assortmentId),
+    };
+  });
+
+  const lossData = {
+    name: `SHORTAGE-${transferId}-${Date.now()}`,
+
+    description: `Списание недостачи при приемке перемещения ${transferId}`,
+
+    organization: getMeta("organization", organizationId),
+
+    store: getMeta("store", storeId),
+
+    positions: {
+      rows: positions,
+    },
+  };
+
+  console.log("SHORTAGE LOSS DATA:", JSON.stringify(lossData, null, 2));
+
+  const loss = await moyskladRequest("/entity/loss", {
+    method: "POST",
+
+    body: JSON.stringify(lossData),
+  });
+
+  return {
+    id: loss.id,
+
+    href: loss.meta?.href || null,
+
+    name: loss.name || lossData.name,
+  };
+}
+async function createExcessSupply({
+  storeId,
+  organizationId,
+  items,
+  transferId,
+}) {
+  const excessItems = items.filter(
+    (item) => Number(item.excessQuantity || 0) > 0,
+  );
+
+  if (excessItems.length === 0) {
+    return null;
+  }
+
+  const positions = excessItems.map((item) => {
+    const quantity = Number(item.excessQuantity);
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error(`Некорректный излишек для товара "${item.name}"`);
+    }
+
+    if (!item.assortmentId) {
+      throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
+    }
+
+    const assortmentType =
+      item.assortmentMeta?.type || item.assortmentMeta?.meta?.type || "product";
+
+    if (!["product", "variant", "bundle", "service"].includes(assortmentType)) {
+      throw new Error(
+        `Неподдерживаемый тип товара "${assortmentType}" для "${item.name}"`,
+      );
+    }
+
+    return {
+      quantity,
+
+      price: Number(item.price || 0) * 100,
+
+      assortment: getMeta(assortmentType, item.assortmentId),
+    };
+  });
+
+  const supplyData = {
+    name: `EXCESS-${transferId}-${Date.now()}`,
+
+    description: `Оприходование излишка при приемке перемещения ${transferId}`,
+
+    organization: getMeta("organization", organizationId),
+
+    store: getMeta("store", storeId),
+
+    positions: {
+      rows: positions,
+    },
+  };
+
+  console.log("EXCESS SUPPLY DATA:", JSON.stringify(supplyData, null, 2));
+
+  const supply = await moyskladRequest("/entity/supply", {
+    method: "POST",
+
+    body: JSON.stringify(supplyData),
+  });
+
+  return {
+    id: supply.id,
+
+    href: supply.meta?.href || null,
+
+    name: supply.name || supplyData.name,
+  };
+}
 /**
  * ----------------------------------------------------
- * Local JSON
+ * LOCAL JSON
  * ----------------------------------------------------
+ */
+
+/**
+ * TRANSFERS
+ *
+ * Новый формат:
+ *
+ * {
+ *   bishkek: [],
+ *   dordoy: [],
+ *   osh: []
+ * }
+ *
+ * Старый:
+ *
+ * []
+ *
+ * Старый массив автоматически переносим
+ * в текущий филиал.
  */
 
 function readTransfers() {
   try {
+    if (!fs.existsSync(TRANSFERS_FILE)) {
+      const empty = createEmptyTransfersStorage();
+
+      fs.writeFileSync(TRANSFERS_FILE, JSON.stringify(empty, null, 2), "utf8");
+
+      return empty;
+    }
+
     const content = fs.readFileSync(TRANSFERS_FILE, "utf8");
 
-    return JSON.parse(content);
+    if (!content.trim()) {
+      const empty = createEmptyTransfersStorage();
+
+      fs.writeFileSync(TRANSFERS_FILE, JSON.stringify(empty, null, 2), "utf8");
+
+      return empty;
+    }
+
+    const parsed = JSON.parse(content);
+
+    /**
+     * Уже новый формат.
+     */
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      BRANCH_KEYS.some((key) =>
+        Object.prototype.hasOwnProperty.call(parsed, key),
+      )
+    ) {
+      const result = createEmptyTransfersStorage();
+
+      for (const key of BRANCH_KEYS) {
+        result[key] = Array.isArray(parsed[key]) ? parsed[key] : [];
+      }
+
+      return result;
+    }
+
+    /**
+     * Старый формат [].
+     *
+     * Переносим записи в текущий филиал.
+     */
+    if (Array.isArray(parsed)) {
+      const branchKey = getBranchKey();
+
+      const migrated = createEmptyTransfersStorage();
+
+      migrated[branchKey] = parsed;
+
+      writeTransfers(migrated);
+
+      return migrated;
+    }
+
+    throw new Error("Неверный формат transfers.json");
   } catch (error) {
     console.error("Ошибка чтения transfers.json:", error);
 
-    return [];
+    return createEmptyTransfersStorage();
   }
 }
 
 function writeTransfers(data) {
-  fs.writeFileSync(TRANSFERS_FILE, JSON.stringify(data, null, 2), "utf8");
+  const normalized = createEmptyTransfersStorage();
+
+  for (const key of BRANCH_KEYS) {
+    normalized[key] = Array.isArray(data?.[key]) ? data[key] : [];
+  }
+
+  fs.writeFileSync(TRANSFERS_FILE, JSON.stringify(normalized, null, 2), "utf8");
 }
+
+/**
+ * CASH
+ *
+ * Новый формат:
+ *
+ * {
+ *   bishkek: {
+ *     balance,
+ *     transactions
+ *   },
+ *   dordoy: {
+ *     balance,
+ *     transactions
+ *   },
+ *   osh: {
+ *     balance,
+ *     transactions
+ *   }
+ * }
+ *
+ * Старый формат:
+ *
+ * {
+ *   balance,
+ *   transactions
+ * }
+ *
+ * Старый баланс переносим в текущий филиал.
+ */
 
 function readCash() {
   try {
     if (!fs.existsSync(CASH_FILE)) {
-      return {
-        balance: 0,
-        transactions: [],
-      };
+      const empty = createEmptyCashStorage();
+
+      fs.writeFileSync(CASH_FILE, JSON.stringify(empty, null, 2), "utf8");
+
+      return empty;
     }
 
     const content = fs.readFileSync(CASH_FILE, "utf8");
 
-    return JSON.parse(content);
+    if (!content.trim()) {
+      const empty = createEmptyCashStorage();
+
+      fs.writeFileSync(CASH_FILE, JSON.stringify(empty, null, 2), "utf8");
+
+      return empty;
+    }
+
+    const parsed = JSON.parse(content);
+
+    /**
+     * Новый формат.
+     */
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      BRANCH_KEYS.some((key) =>
+        Object.prototype.hasOwnProperty.call(parsed, key),
+      )
+    ) {
+      const result = createEmptyCashStorage();
+
+      for (const key of BRANCH_KEYS) {
+        const branchCash = parsed[key];
+
+        result[key] = {
+          balance: Number(branchCash?.balance || 0),
+
+          transactions: Array.isArray(branchCash?.transactions)
+            ? branchCash.transactions
+            : [],
+        };
+      }
+
+      return result;
+    }
+
+    /**
+     * Старый формат:
+     *
+     * {
+     *   balance,
+     *   transactions
+     * }
+     */
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      (Object.prototype.hasOwnProperty.call(parsed, "balance") ||
+        Object.prototype.hasOwnProperty.call(parsed, "transactions"))
+    ) {
+      const branchKey = getBranchKey();
+
+      const migrated = createEmptyCashStorage();
+
+      migrated[branchKey] = {
+        balance: Number(parsed.balance || 0),
+
+        transactions: Array.isArray(parsed.transactions)
+          ? parsed.transactions
+          : [],
+      };
+
+      writeCash(migrated);
+
+      return migrated;
+    }
+
+    throw new Error("Неверный формат cash.json");
   } catch (error) {
     console.error("Ошибка чтения cash.json:", error);
 
-    return {
-      balance: 0,
-      transactions: [],
-    };
+    return createEmptyCashStorage();
   }
 }
 
 function writeCash(data) {
-  fs.writeFileSync(CASH_FILE, JSON.stringify(data, null, 2), "utf8");
+  const normalized = createEmptyCashStorage();
+
+  for (const key of BRANCH_KEYS) {
+    normalized[key] = {
+      balance: Number(data?.[key]?.balance || 0),
+
+      transactions: Array.isArray(data?.[key]?.transactions)
+        ? data[key].transactions
+        : [],
+    };
+  }
+
+  fs.writeFileSync(CASH_FILE, JSON.stringify(normalized, null, 2), "utf8");
 }
 
 /**
  * ----------------------------------------------------
  * GET /api/transfers
- *
- * Все локальные перемещения/поступления
  * ----------------------------------------------------
+ *
+ * Возвращает записи текущего филиала.
  */
 
 router.get("/", (req, res) => {
   try {
+    const branchKey = getBranchKey();
+
     const transfers = readTransfers();
 
     res.json({
-      rows: transfers,
+      rows: transfers[branchKey] || [],
     });
   } catch (error) {
-    console.error(error);
+    console.error("GET /api/transfers:", error);
 
     res.status(500).json({
       message: error.message || "Не удалось загрузить перемещения",
@@ -181,8 +599,6 @@ router.get("/", (req, res) => {
 /**
  * ----------------------------------------------------
  * GET /api/transfers/warehouses
- *
- * Получаем склады/магазины из МойСклад
  * ----------------------------------------------------
  */
 
@@ -212,10 +628,6 @@ router.get("/warehouses", async (req, res) => {
 /**
  * ----------------------------------------------------
  * GET /api/transfers/suppliers
- *
- * Получаем контрагентов.
- *
- * На фронте можно выбрать нужного поставщика.
  * ----------------------------------------------------
  */
 
@@ -245,28 +657,225 @@ router.get("/suppliers", async (req, res) => {
 /**
  * ----------------------------------------------------
  * GET /api/transfers/incoming
- *
- * Получаем входящие перемещения.
- *
- * Важно:
- * Это локальные записи, которые были созданы
- * нашей системой.
  * ----------------------------------------------------
+ *
+ * Входящие перемещения должны быть видны
+ * филиалу-получателю.
+ *
+ * Поэтому ищем по ВСЕМ филиалам,
+ * а не только в текущем массиве.
  */
 
-router.get("/incoming", (req, res) => {
+router.get("/incoming", async (req, res) => {
   try {
-    const storeId = req.query.storeId;
+    const branch = getCurrentBranch();
+
+    const storeId = branch.storeId;
 
     if (!storeId) {
-      return res.status(400).json({
-        message: "Не передан storeId",
+      return res.status(500).json({
+        message: "У текущего филиала не указан storeId",
       });
     }
 
-    const transfers = readTransfers();
+    /**
+     * ------------------------------------------------
+     * 1. Получаем перемещения непосредственно из МойСклад
+     * ------------------------------------------------
+     */
 
-    const incoming = transfers
+    const moyskladMoves = await getMoySkladMoves();
+
+    /**
+     * ------------------------------------------------
+     * 2. Получаем наши локальные перемещения
+     * ------------------------------------------------
+     */
+
+    const transfersStorage = readTransfers();
+
+    const allLocalTransfers = BRANCH_KEYS.flatMap((key) =>
+      Array.isArray(transfersStorage[key]) ? transfersStorage[key] : [],
+    );
+
+    /**
+     * ------------------------------------------------
+     * 3. Сегодняшняя дата по Бишкеку
+     * ------------------------------------------------
+     */
+
+    const today = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Bishkek",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+
+    /**
+     * ------------------------------------------------
+     * 4. Находим перемещения МойСклад,
+     *    которые идут НА текущий склад
+     * ------------------------------------------------
+     */
+
+    const incomingMoySklad = moyskladMoves.filter((move) => {
+      const targetStoreId =
+        move.targetStore?.id || move.targetStore?.meta?.href?.split("/").pop();
+
+      if (targetStoreId !== storeId) {
+        return false;
+      }
+
+      const createdDate = move.created
+        ? new Intl.DateTimeFormat("en-CA", {
+            timeZone: "Asia/Bishkek",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+          }).format(new Date(move.created))
+        : null;
+
+      return createdDate === today;
+    });
+
+    /**
+     * ------------------------------------------------
+     * 5. Превращаем перемещения МойСклад
+     *    в формат нашего POS
+     * ------------------------------------------------
+     */
+
+    const importedTransfers = [];
+
+    for (const move of incomingMoySklad) {
+      /**
+       * Если это перемещение уже есть
+       * в нашем transfers.json,
+       * повторно его не создаём.
+       */
+
+      const existing = allLocalTransfers.find(
+        (item) => item.moyskladId === move.id,
+      );
+
+      if (existing) {
+        continue;
+      }
+
+      const sourceStoreId =
+        move.sourceStore?.id || move.sourceStore?.meta?.href?.split("/").pop();
+
+      const targetStoreId =
+        move.targetStore?.id || move.targetStore?.meta?.href?.split("/").pop();
+
+      /**
+       * ------------------------------------------------
+       * Получаем позиции
+       * ------------------------------------------------
+       */
+
+      const positions = move.positions?.rows || [];
+
+      const items = positions.map((position) => {
+        const assortment = position.assortment;
+
+        const assortmentId =
+          assortment?.id || assortment?.meta?.href?.split("/").pop();
+
+        return {
+          assortmentId,
+
+          name: assortment?.name || assortment?.displayName || "Без названия",
+
+          quantity: Number(position.quantity || 0),
+          assortmentMeta: assortment?.meta || null,
+          price: Number(position.price || 0) / 100,
+
+          receivedQuantity: null,
+
+          shortageQuantity: null,
+        };
+      });
+
+      /**
+       * ------------------------------------------------
+       * Создаём локальную запись
+       * ------------------------------------------------
+       */
+
+      const localTransfer = {
+        id: `MS-${move.id}`,
+
+        type: "transfer",
+
+        status: "sent",
+
+        moyskladId: move.id,
+
+        moyskladHref: move.meta?.href || null,
+
+        fromBranch: null,
+
+        fromWarehouse: {
+          id: sourceStoreId || null,
+
+          name: move.sourceStore?.name || sourceStoreId || "Склад отправителя",
+        },
+
+        toWarehouse: {
+          id: targetStoreId || storeId,
+
+          name: move.targetStore?.name || branch.name || storeId,
+        },
+
+        items,
+
+        createdAt: move.created || new Date().toISOString(),
+
+        receivedAt: null,
+      };
+
+      importedTransfers.push(localTransfer);
+    }
+
+    /**
+     * ------------------------------------------------
+     * 6. Сохраняем найденные перемещения
+     *    в текущий филиал
+     * ------------------------------------------------
+     */
+
+    if (importedTransfers.length > 0) {
+      const branchKey = getBranchKey(branch);
+
+      if (!Array.isArray(transfersStorage[branchKey])) {
+        transfersStorage[branchKey] = [];
+      }
+
+      transfersStorage[branchKey].push(...importedTransfers);
+
+      writeTransfers(transfersStorage);
+    }
+
+    /**
+     * ------------------------------------------------
+     * 7. После синхронизации снова читаем storage
+     * ------------------------------------------------
+     */
+
+    const updatedStorage = readTransfers();
+
+    const allTransfers = BRANCH_KEYS.flatMap((key) =>
+      Array.isArray(updatedStorage[key]) ? updatedStorage[key] : [],
+    );
+
+    /**
+     * ------------------------------------------------
+     * 8. Возвращаем входящие перемещения
+     * ------------------------------------------------
+     */
+
+    const incoming = allTransfers
       .filter(
         (item) =>
           item.type === "transfer" &&
@@ -279,7 +888,7 @@ router.get("/incoming", (req, res) => {
       rows: incoming,
     });
   } catch (error) {
-    console.error(error);
+    console.error("GET /api/transfers/incoming:", error);
 
     res.status(500).json({
       message: error.message || "Не удалось загрузить входящие перемещения",
@@ -290,26 +899,24 @@ router.get("/incoming", (req, res) => {
 /**
  * ----------------------------------------------------
  * POST /api/transfers/outgoing
+ * ----------------------------------------------------
  *
  * Филиал A -> Филиал B
- *
- * Создаём:
- *
- * МойСклад:
- * entity/move
- *
- * Локально:
- * transfers.json
- * ----------------------------------------------------
  */
 
 router.post("/outgoing", async (req, res) => {
   try {
-    const { fromWarehouseId, toWarehouseId, items } = req.body;
+    const { toWarehouseId, items } = req.body;
+
+    const branch = getCurrentBranch();
+
+    const branchKey = getBranchKey(branch);
+
+    const fromWarehouseId = branch.storeId;
 
     if (!fromWarehouseId) {
-      return res.status(400).json({
-        message: "Не указан склад отправителя",
+      return res.status(500).json({
+        message: "У текущего филиала не указан storeId",
       });
     }
 
@@ -331,12 +938,6 @@ router.post("/outgoing", async (req, res) => {
       });
     }
 
-    /**
-     * Получаем организацию.
-     *
-     * Если в аккаунте несколько организаций,
-     * пока берём первую.
-     */
     const organizations = await moyskladRequest(
       "/entity/organization?limit=100",
     );
@@ -346,10 +947,6 @@ router.post("/outgoing", async (req, res) => {
     }
 
     const organization = organizations.rows[0];
-
-    /**
-     * Формируем позиции перемещения.
-     */
 
     const positions = items.map((item) => {
       if (!item.assortmentId) {
@@ -362,17 +959,18 @@ router.post("/outgoing", async (req, res) => {
         throw new Error(`Некорректное количество товара "${item.name}"`);
       }
 
+      if (!item.assortmentMeta) {
+        throw new Error(`У товара "${item.name}" отсутствует assortmentMeta`);
+      }
+
       return {
         quantity,
+
         assortment: {
           meta: item.assortmentMeta,
         },
       };
     });
-
-    /**
-     * Создаём перемещение в МойСклад.
-     */
 
     const moveData = {
       name: `TR-${Date.now()}`,
@@ -395,11 +993,6 @@ router.post("/outgoing", async (req, res) => {
       body: JSON.stringify(moveData),
     });
 
-    /**
-     * Получаем названия складов,
-     * чтобы локальная запись была удобной.
-     */
-
     const stores = await moyskladRequest("/entity/store?limit=100");
 
     const sourceStore = stores.rows?.find(
@@ -410,10 +1003,6 @@ router.post("/outgoing", async (req, res) => {
       (store) => store.id === toWarehouseId,
     );
 
-    /**
-     * Локальная запись.
-     */
-
     const transfers = readTransfers();
 
     const localTransfer = {
@@ -422,11 +1011,12 @@ router.post("/outgoing", async (req, res) => {
       type: "transfer",
 
       status: "sent",
-      paymentStatus: moyskladMove.paymentMethod,
 
       moyskladId: moyskladMove.id,
 
       moyskladHref: moyskladMove.meta?.href || null,
+
+      fromBranch: branchKey,
 
       fromWarehouse: {
         id: fromWarehouseId,
@@ -440,9 +1030,19 @@ router.post("/outgoing", async (req, res) => {
 
       items: items.map((item) => ({
         assortmentId: item.assortmentId,
+
         name: item.name,
+
+        // Сколько отправили
         quantity: Number(item.quantity),
+        assortmentMeta: item.assortmentMeta || null,
         price: Number(item.price || 0),
+
+        // Сколько реально приняли
+        receivedQuantity: null,
+
+        // Недостача
+        shortageQuantity: null,
       })),
 
       createdAt: new Date().toISOString(),
@@ -450,15 +1050,22 @@ router.post("/outgoing", async (req, res) => {
       receivedAt: null,
     };
 
-    transfers.push(localTransfer);
+    if (!Array.isArray(transfers[branchKey])) {
+      transfers[branchKey] = [];
+    }
+
+    transfers[branchKey].push(localTransfer);
 
     writeTransfers(transfers);
 
     res.status(201).json({
       success: true,
+
       transfer: localTransfer,
+
       moysklad: {
         id: moyskladMove.id,
+
         href: moyskladMove.meta?.href || null,
       },
     });
@@ -473,93 +1080,33 @@ router.post("/outgoing", async (req, res) => {
 
 /**
  * ----------------------------------------------------
- * POST /api/transfers/receipt
- *
- * Поступление от поставщика.
- *
- * Создаём:
- *
- * МойСклад:
- * entity/supply
- *
- * Локально:
- * transfers.json
+ * РАСКРЫТИЕ КОМПЛЕКТА
  * ----------------------------------------------------
  */
 
-/**
- * ----------------------------------------------------
- * Раскрытие комплекта
- * ----------------------------------------------------
- *
- * Supply не принимает bundle напрямую.
- * Поэтому получаем состав комплекта и
- * превращаем его в обычные позиции.
- */
-/**
- * ----------------------------------------------------
- * Раскрытие комплекта для Supply
- * ----------------------------------------------------
- *
- * ВАЖНО:
- * МойСклад НЕ разрешает:
- *
- * supply.positions.rows[].assortment.type === "bundle"
- *
- * Поэтому комплект полностью раскрываем
- * в его компоненты.
- */
 async function expandBundle(item) {
   if (!item.assortmentId) {
-    throw new Error(
-      `У товара "${item.name}" отсутствует assortmentId`,
-    );
+    throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
   }
 
   const quantity = Number(item.quantity);
 
   if (!Number.isFinite(quantity) || quantity <= 0) {
-    throw new Error(
-      `Некорректное количество товара "${item.name}"`,
-    );
+    throw new Error(`Некорректное количество товара "${item.name}"`);
   }
-
-  /**
-   * Тип ассортимента уже приходит с фронта.
-   *
-   * product.meta:
-   * {
-   *   href: ".../entity/product/...",
-   *   type: "product"
-   * }
-   *
-   * bundle.meta:
-   * {
-   *   href: ".../entity/bundle/...",
-   *   type: "bundle"
-   * }
-   */
 
   const assortmentMeta = item.assortmentMeta;
 
   if (!assortmentMeta) {
-    throw new Error(
-      `У товара "${item.name}" отсутствует assortmentMeta`,
-    );
+    throw new Error(`У товара "${item.name}" отсутствует assortmentMeta`);
   }
 
-  const assortmentType =
-    assortmentMeta.type ||
-    assortmentMeta.meta?.type;
+  const assortmentType = assortmentMeta.type || assortmentMeta.meta?.type;
 
-  console.log(
-    `Товар "${item.name}" -> тип: ${assortmentType}`,
-  );
+  console.log(`Товар "${item.name}" -> тип: ${assortmentType}`);
 
   /**
-   * --------------------------------------------------
-   * Обычный товар / модификация
-   * --------------------------------------------------
+   * Обычный товар / модификация.
    */
 
   if (assortmentType !== "bundle") {
@@ -567,9 +1114,7 @@ async function expandBundle(item) {
       {
         quantity,
 
-        price: Math.round(
-          Number(item.price || 0) * 100,
-        ),
+        price: Math.round(Number(item.price || 0) * 100),
 
         assortment: {
           meta: assortmentMeta,
@@ -579,110 +1124,55 @@ async function expandBundle(item) {
   }
 
   /**
-   * --------------------------------------------------
-   * Это комплект
-   * --------------------------------------------------
+   * Комплект.
    */
 
-  const bundleId =
-    assortmentMeta.href
-      ?.split("/")
-      .filter(Boolean)
-      .pop();
+  const bundleId = assortmentMeta.href?.split("/").filter(Boolean).pop();
 
   if (!bundleId) {
-    throw new Error(
-      `Не удалось определить ID комплекта "${item.name}"`,
-    );
+    throw new Error(`Не удалось определить ID комплекта "${item.name}"`);
   }
+
+  console.log(`Получаем комплект ${bundleId} из МойСклад`);
+
+  const bundle = await moyskladRequest(`/entity/bundle/${bundleId}`);
+
+  if (!bundle?.id) {
+    throw new Error(`Комплект "${item.name}" не найден в МойСклад`);
+  }
+
+  const componentsData = await moyskladRequest(
+    `/entity/bundle/${bundleId}/components?limit=100`,
+  );
+
+  const components = componentsData?.rows || [];
 
   console.log(
-    `Получаем комплект ${bundleId} из МойСклад`,
+    `КОМПОНЕНТЫ КОМПЛЕКТА "${item.name}":`,
+    JSON.stringify(components, null, 2),
   );
-
-  /**
-   * Получаем комплект правильным endpoint:
-   *
-   * /entity/bundle/{id}
-   */
-
-const bundle = await moyskladRequest(
-  `/entity/bundle/${bundleId}`,
-);
-
-if (!bundle?.id) {
-  throw new Error(
-    `Комплект "${item.name}" не найден в МойСклад`,
-  );
-}
-
-/**
- * Компоненты комплекта получаем
- * отдельным endpoint.
- */
-const componentsData = await moyskladRequest(
-  `/entity/bundle/${bundleId}/components?limit=100`,
-);
-
-const components =
-  componentsData?.rows || [];
-
-console.log(
-  `КОМПОНЕНТЫ КОМПЛЕКТА "${item.name}":`,
-  JSON.stringify(components, null, 2),
-);
-
-if (components.length === 0) {
-  throw new Error(
-    `Комплект "${item.name}" не содержит компонентов`,
-  );
-}
 
   if (components.length === 0) {
-    throw new Error(
-      `Комплект "${item.name}" не содержит компонентов`,
-    );
+    throw new Error(`Комплект "${item.name}" не содержит компонентов`);
   }
 
-  /**
-   * Цена всего комплекта.
-   */
+  const bundlePrice = Number(item.price || 0);
 
-  const bundlePrice =
-    Number(item.price || 0);
-
-  /**
-   * Общее количество частей.
-   */
-
-  const totalParts =
-    components.reduce(
-      (sum, component) =>
-        sum + Number(component.quantity || 0),
-      0,
-    );
+  const totalParts = components.reduce(
+    (sum, component) => sum + Number(component.quantity || 0),
+    0,
+  );
 
   const result = [];
 
-  /**
-   * --------------------------------------------------
-   * Раскрываем комплект
-   * --------------------------------------------------
-   */
-
   for (const component of components) {
-    const componentQuantity =
-      Number(component.quantity || 0);
+    const componentQuantity = Number(component.quantity || 0);
 
-    if (
-      !Number.isFinite(componentQuantity) ||
-      componentQuantity <= 0
-    ) {
+    if (!Number.isFinite(componentQuantity) || componentQuantity <= 0) {
       continue;
     }
 
-    const componentMeta =
-      component.assortment?.meta;
+    const componentMeta = component.assortment?.meta;
 
     if (!componentMeta) {
       throw new Error(
@@ -690,42 +1180,21 @@ if (components.length === 0) {
       );
     }
 
-    /**
-     * Вложенный комплект пока запрещаем.
-     */
-
     if (componentMeta.type === "bundle") {
       throw new Error(
         `Комплект "${item.name}" содержит вложенный комплект. Такой комплект нужно обработать отдельно.`,
       );
     }
 
-    /**
-     * Количество компонента:
-     *
-     * компонент × количество комплектов
-     */
-
-    const finalQuantity =
-      componentQuantity * quantity;
-
-    /**
-     * Распределяем стоимость комплекта
-     * между компонентами.
-     */
+    const finalQuantity = componentQuantity * quantity;
 
     const componentPrice =
-      totalParts > 0
-        ? bundlePrice *
-          (componentQuantity / totalParts)
-        : 0;
+      totalParts > 0 ? bundlePrice * (componentQuantity / totalParts) : 0;
 
     result.push({
       quantity: finalQuantity,
 
-      price: Math.round(
-        componentPrice * 100,
-      ),
+      price: Math.round(componentPrice * 100),
 
       assortment: {
         meta: componentMeta,
@@ -734,9 +1203,7 @@ if (components.length === 0) {
   }
 
   if (result.length === 0) {
-    throw new Error(
-      `Комплект "${item.name}" не удалось раскрыть`,
-    );
+    throw new Error(`Комплект "${item.name}" не удалось раскрыть`);
   }
 
   console.log(
@@ -747,15 +1214,37 @@ if (components.length === 0) {
   return result;
 }
 
+/**
+ * ----------------------------------------------------
+ * POST /api/transfers/receipt
+ * ----------------------------------------------------
+ *
+ * Приход от поставщика.
+ *
+ * ВАЖНЫЙ ПОРЯДОК:
+ *
+ * 1. Проверяем текущий филиал.
+ * 2. Проверяем сумму.
+ * 3. Если cash — проверяем кассу.
+ * 4. Проверяем товары.
+ * 5. Только после этого создаём Supply.
+ * 6. После успешного Supply списываем деньги.
+ * 7. Записываем локальную операцию.
+ */
+
 router.post("/receipt", async (req, res) => {
-
-
   try {
-    const { storeId, supplierId, items, totalAmount, paymentMethod } = req.body;
+    const { supplierId, items, totalAmount, paymentMethod } = req.body;
+
+    const branch = getCurrentBranch();
+
+    const branchKey = getBranchKey(branch);
+
+    const storeId = branch.storeId;
 
     if (!storeId) {
-      return res.status(400).json({
-        message: "Не указан склад поступления",
+      return res.status(500).json({
+        message: "У текущего филиала не указан storeId",
       });
     }
 
@@ -771,6 +1260,50 @@ router.post("/receipt", async (req, res) => {
       });
     }
 
+    /**
+     * ---------------------------------------------
+     * Сумма
+     * ---------------------------------------------
+     */
+
+    const purchaseAmount = Number(totalAmount || 0);
+
+    if (!Number.isFinite(purchaseAmount) || purchaseAmount < 0) {
+      return res.status(400).json({
+        message: "Некорректная сумма поступления",
+      });
+    }
+
+    /**
+     * ---------------------------------------------
+     * ПРОВЕРКА КАССЫ ДО SUPPLY
+     * ---------------------------------------------
+     *
+     * Это самое важное исправление.
+     */
+
+    let cashStorage = null;
+    let branchCash = null;
+
+    if (paymentMethod === "cash" && purchaseAmount > 0) {
+      cashStorage = readCash();
+
+      branchCash = cashStorage[branchKey];
+
+      if (!branchCash) {
+        branchCash = createEmptyCashBranch();
+
+        cashStorage[branchKey] = branchCash;
+      }
+
+      const currentBalance = Number(branchCash.balance || 0);
+
+      if (currentBalance < purchaseAmount) {
+        return res.status(400).json({
+          message: `Недостаточно денег в кассе филиала. Баланс: ${currentBalance} сом, требуется: ${purchaseAmount} сом`,
+        });
+      }
+    }
     /**
      * ---------------------------------------------
      * Организация
@@ -815,29 +1348,25 @@ router.post("/receipt", async (req, res) => {
 
     /**
      * ---------------------------------------------
-     * Проверяем товары и получаем
-     * настоящие meta из МойСклад
+     * Позиции
      * ---------------------------------------------
      */
 
-const positions = [];
+    const positions = [];
 
-for (const item of items) {
-  const expandedPositions =
-    await expandBundle(item);
+    for (const item of items) {
+      const expandedPositions = await expandBundle(item);
 
-  positions.push(...expandedPositions);
-}
+      positions.push(...expandedPositions);
+    }
 
-if (positions.length === 0) {
-  throw new Error(
-    "После обработки товаров не осталось позиций",
-  );
-}
+    if (positions.length === 0) {
+      throw new Error("После обработки товаров не осталось позиций");
+    }
 
     /**
      * ---------------------------------------------
-     * Supply
+     * SUPPLY
      * ---------------------------------------------
      */
 
@@ -867,7 +1396,7 @@ if (positions.length === 0) {
 
     /**
      * ---------------------------------------------
-     * Создаём поступление
+     * СОЗДАЁМ SUPPLY
      * ---------------------------------------------
      */
 
@@ -879,37 +1408,64 @@ if (positions.length === 0) {
 
     /**
      * ---------------------------------------------
-     * Списание денег из кассы
+     * СПИСАНИЕ ИЗ КАССЫ
      * ---------------------------------------------
+     *
+     * debt:
+     * ничего не списываем.
+     *
+     * cash:
+     * списываем из текущего филиала.
      */
 
-    const purchaseAmount = Number(totalAmount || 0);
-
-    if (!Number.isFinite(purchaseAmount) || purchaseAmount < 0) {
-      throw new Error("Некорректная сумма поступления");
-    }
-
     if (paymentMethod === "cash" && purchaseAmount > 0) {
-      const cash = readCash();
+      /**
+       * Повторно читаем файл,
+       * чтобы получить актуальное состояние.
+       */
 
-      const currentBalance = Number(cash.balance || 0);
+      const latestCash = readCash();
+
+      if (!latestCash[branchKey]) {
+        latestCash[branchKey] = createEmptyCashBranch();
+      }
+
+      const currentBalance = Number(latestCash[branchKey].balance || 0);
+
+      /**
+       * Защита от ситуации,
+       * когда касса изменилась между
+       * предварительной проверкой и Supply.
+       *
+       * Supply уже создан, поэтому здесь
+       * просто не допускаем отрицательного
+       * баланса.
+       */
 
       if (currentBalance < purchaseAmount) {
-        throw new Error(
-          `Недостаточно денег в кассе. Баланс: ${currentBalance} сом, требуется: ${purchaseAmount} сом`,
+        console.error(
+          "Критическая ситуация: Supply создан, но кассы недостаточно",
         );
+
+        return res.status(500).json({
+          success: false,
+
+          message:
+            "Поступление в МойСклад создано, но списание из кассы не выполнено: баланс изменился до завершения операции.",
+        });
       }
 
       const balanceBefore = currentBalance;
+
       const balanceAfter = balanceBefore - purchaseAmount;
 
-      cash.balance = balanceAfter;
+      latestCash[branchKey].balance = balanceAfter;
 
-      if (!Array.isArray(cash.transactions)) {
-        cash.transactions = [];
+      if (!Array.isArray(latestCash[branchKey].transactions)) {
+        latestCash[branchKey].transactions = [];
       }
 
-      cash.transactions.push({
+      latestCash[branchKey].transactions.push({
         id: `CASH-BUY-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 
         type: "buyFromPostavshik",
@@ -919,6 +1475,8 @@ if (positions.length === 0) {
         balanceBefore,
 
         balanceAfter,
+
+        branch: branchKey,
 
         supplierId: supplier.id,
 
@@ -931,12 +1489,12 @@ if (positions.length === 0) {
         createdAt: new Date().toISOString(),
       });
 
-      writeCash(cash);
+      writeCash(latestCash);
     }
 
     /**
      * ---------------------------------------------
-     * Локальная запись
+     * ЛОКАЛЬНАЯ ЗАПИСЬ
      * ---------------------------------------------
      */
 
@@ -949,9 +1507,14 @@ if (positions.length === 0) {
 
       status: "received",
 
+      branch: branchKey,
+
       moyskladId: moyskladSupply.id,
+
       paymentStatus: paymentMethod,
-      totalAmount: Number(totalAmount || 0),
+
+      totalAmount: purchaseAmount,
+
       moyskladHref: moyskladSupply.meta?.href || null,
 
       toWarehouse: {
@@ -970,7 +1533,7 @@ if (positions.length === 0) {
         assortmentId: item.assortmentId,
 
         name: item.name,
-
+        assortmentMeta: item.assortmentMeta || null,
         quantity: Number(item.quantity),
 
         price: Number(item.price || 0),
@@ -981,7 +1544,11 @@ if (positions.length === 0) {
       receivedAt: new Date().toISOString(),
     };
 
-    transfers.push(localReceipt);
+    if (!Array.isArray(transfers[branchKey])) {
+      transfers[branchKey] = [];
+    }
+
+    transfers[branchKey].push(localReceipt);
 
     writeTransfers(transfers);
 
@@ -1008,34 +1575,82 @@ if (positions.length === 0) {
 /**
  * ----------------------------------------------------
  * POST /api/transfers/:id/confirm
- *
- * Подтверждаем локальный приём
- * перемещения между филиалами.
- *
- * ВАЖНО:
- * Второй supply здесь НЕ создаём.
  * ----------------------------------------------------
+ *
+ * Подтверждение входящего перемещения.
+ *
+ * Ищем запись во всех филиалах, потому что
+ * отправитель сохраняет её в своём филиале.
  */
 
-router.post("/:id/confirm", (req, res) => {
+router.post("/:id/confirm", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const transfers = readTransfers();
+    const { receivedItems } = req.body || {};
 
-    const index = transfers.findIndex((item) => item.id === id);
+    const currentBranch = getCurrentBranch();
 
-    if (index === -1) {
+    const currentStoreId = currentBranch.storeId;
+
+    if (!currentStoreId) {
+      return res.status(500).json({
+        message: "У текущего филиала не указан storeId",
+      });
+    }
+
+    if (!Array.isArray(receivedItems)) {
+      return res.status(400).json({
+        message: "Не переданы фактически принятые количества",
+      });
+    }
+
+    const transfersStorage = readTransfers();
+
+    let foundBranchKey = null;
+    let foundIndex = -1;
+
+    /**
+     * ------------------------------------------------
+     * Ищем перемещение во всех филиалах
+     * ------------------------------------------------
+     */
+
+    for (const branchKey of BRANCH_KEYS) {
+      const rows = transfersStorage[branchKey] || [];
+
+      const index = rows.findIndex((item) => item.id === id);
+
+      if (index !== -1) {
+        foundBranchKey = branchKey;
+        foundIndex = index;
+        break;
+      }
+    }
+
+    if (foundBranchKey === null || foundIndex === -1) {
       return res.status(404).json({
         message: "Перемещение не найдено",
       });
     }
 
-    const transfer = transfers[index];
+    const transfer = transfersStorage[foundBranchKey][foundIndex];
+
+    /**
+     * ------------------------------------------------
+     * Проверки
+     * ------------------------------------------------
+     */
 
     if (transfer.type !== "transfer") {
       return res.status(400).json({
         message: "Эту запись нельзя подтвердить как перемещение",
+      });
+    }
+
+    if (transfer.toWarehouse?.id !== currentStoreId) {
+      return res.status(403).json({
+        message: "Это перемещение предназначено для другого филиала",
       });
     }
 
@@ -1045,22 +1660,336 @@ router.post("/:id/confirm", (req, res) => {
       });
     }
 
+    if (!Array.isArray(transfer.items) || transfer.items.length === 0) {
+      return res.status(400).json({
+        message: "В перемещении нет товаров",
+      });
+    }
+
+    /**
+     * ------------------------------------------------
+     * receivedItems -> Map
+     * ------------------------------------------------
+     */
+
+    const receivedMap = new Map();
+
+    for (const row of receivedItems) {
+      const assortmentId = String(row?.assortmentId || "");
+
+      if (!assortmentId) {
+        return res.status(400).json({
+          message: "У одного из принятых товаров отсутствует assortmentId",
+        });
+      }
+
+      if (receivedMap.has(assortmentId)) {
+        return res.status(400).json({
+          message: `Товар ${assortmentId} передан несколько раз`,
+        });
+      }
+
+      receivedMap.set(assortmentId, row);
+    }
+
+    /**
+     * ------------------------------------------------
+     * Рассчитываем фактическую приемку
+     * ------------------------------------------------
+     */
+
+    const updatedItems = transfer.items.map((item) => {
+      const assortmentId = String(item.assortmentId);
+
+      const receivedRow = receivedMap.get(assortmentId);
+
+      if (!receivedRow) {
+        throw new Error(`Не указано принятое количество для "${item.name}"`);
+      }
+
+      const sentQuantity = Number(item.quantity);
+
+      const receivedQuantity = Number(
+        String(receivedRow.receivedQuantity ?? "").replace(",", "."),
+      );
+
+      if (!Number.isFinite(sentQuantity) || sentQuantity < 0) {
+        throw new Error(
+          `Некорректное отправленное количество для "${item.name}"`,
+        );
+      }
+
+      if (!Number.isFinite(receivedQuantity) || receivedQuantity < 0) {
+        throw new Error(`Некорректное принятое количество для "${item.name}"`);
+      }
+
+      // if (receivedQuantity > sentQuantity) {
+      //   throw new Error(
+      //     `Для "${item.name}" нельзя принять ${receivedQuantity} шт. — отправлено только ${sentQuantity} шт.`,
+      //   );
+      // }
+
+      const shortageQuantity = Math.max(sentQuantity - receivedQuantity, 0);
+
+      const excessQuantity = Math.max(receivedQuantity - sentQuantity, 0);
+
+      return {
+        ...item,
+
+        receivedQuantity,
+
+        shortageQuantity,
+
+        excessQuantity,
+      };
+    });
+
+    /**
+     * ------------------------------------------------
+     * Итоги
+     * ------------------------------------------------
+     */
+
+    const totalSentQuantity = updatedItems.reduce(
+      (sum, item) => sum + Number(item.quantity || 0),
+      0,
+    );
+
+    const totalReceivedQuantity = updatedItems.reduce(
+      (sum, item) => sum + Number(item.receivedQuantity || 0),
+      0,
+    );
+
+    const totalShortageQuantity = updatedItems.reduce(
+      (sum, item) => sum + Number(item.shortageQuantity || 0),
+      0,
+    );
+
+    const totalExcessQuantity = updatedItems.reduce(
+      (sum, item) => sum + Number(item.excessQuantity || 0),
+      0,
+    );
+
+    /**
+     * ------------------------------------------------
+     * ЕСЛИ ЕСТЬ НЕДОСТАЧА
+     *
+     * Создаём Списание в МойСклад
+     * на складе-получателе.
+     * ------------------------------------------------
+     */
+
+    let shortageLoss = null;
+
+    if (totalShortageQuantity > 0) {
+      /**
+       * Получаем организацию.
+       */
+
+      const organizations = await moyskladRequest(
+        "/entity/organization?limit=100",
+      );
+
+      if (!organizations.rows || organizations.rows.length === 0) {
+        throw new Error(
+          "В МойСклад не найдена организация для списания недостачи",
+        );
+      }
+
+      const organization = organizations.rows[0];
+
+      /**
+       * Для старых локальных перемещений
+       * assortmentMeta может отсутствовать.
+       *
+       * В таком случае восстанавливаем meta
+       * по ID товара.
+       */
+
+      const itemsForLoss = await Promise.all(
+        updatedItems.map(async (item) => {
+          if (Number(item.shortageQuantity || 0) <= 0) {
+            return item;
+          }
+
+          if (item.assortmentMeta) {
+            return item;
+          }
+
+          /**
+           * Если meta отсутствует,
+           * получаем товар из МойСклад.
+           */
+
+          const assortment = await moyskladRequest(
+            `/entity/product/${item.assortmentId}`,
+          );
+
+          if (!assortment?.meta) {
+            throw new Error(
+              `Не удалось получить товар "${item.name}" из МойСклад`,
+            );
+          }
+
+          return {
+            ...item,
+            assortmentMeta: assortment.meta,
+          };
+        }),
+      );
+
+      shortageLoss = await createShortageLoss({
+        storeId: currentStoreId,
+
+        organizationId: organization.id,
+
+        items: itemsForLoss,
+
+        transferId: transfer.moyskladId || transfer.id,
+      });
+    }
+
+    /**
+     * ------------------------------------------------
+     * ЕСЛИ ЕСТЬ ИЗЛИШЕК
+     *
+     * Создаём Оприходование в МойСклад
+     * на складе-получателе.
+     * ------------------------------------------------
+     */
+
+    let excessSupply = null;
+
+    if (totalExcessQuantity > 0) {
+      /**
+       * Получаем организацию.
+       *
+       * Если выше уже получали организацию
+       * для недостачи, здесь получаем её отдельно
+       * только если есть излишек.
+       */
+
+      const organizations = await moyskladRequest(
+        "/entity/organization?limit=100",
+      );
+
+      if (!organizations.rows || organizations.rows.length === 0) {
+        throw new Error(
+          "В МойСклад не найдена организация для оприходования излишка",
+        );
+      }
+
+      const organization = organizations.rows[0];
+
+      /**
+       * Для старых локальных перемещений
+       * восстанавливаем assortmentMeta.
+       */
+
+      const itemsForExcess = await Promise.all(
+        updatedItems.map(async (item) => {
+          if (Number(item.excessQuantity || 0) <= 0) {
+            return item;
+          }
+
+          if (item.assortmentMeta) {
+            return item;
+          }
+
+          const assortment = await moyskladRequest(
+            `/entity/product/${item.assortmentId}`,
+          );
+
+          if (!assortment?.meta) {
+            throw new Error(
+              `Не удалось получить товар "${item.name}" из МойСклад`,
+            );
+          }
+
+          return {
+            ...item,
+
+            assortmentMeta: assortment.meta,
+          };
+        }),
+      );
+
+      excessSupply = await createExcessSupply({
+        storeId: currentStoreId,
+
+        organizationId: organization.id,
+
+        items: itemsForExcess,
+
+        transferId: transfer.moyskladId || transfer.id,
+      });
+    }
+
+    /**
+     * ------------------------------------------------
+     * Сохраняем результат приемки
+     * ------------------------------------------------
+     */
+
+    transfer.items = updatedItems;
+
+    transfer.totalSentQuantity = totalSentQuantity;
+
+    transfer.totalReceivedQuantity = totalReceivedQuantity;
+
+    transfer.totalShortageQuantity = totalShortageQuantity;
+
     transfer.status = "received";
 
     transfer.receivedAt = new Date().toISOString();
 
-    transfers[index] = transfer;
+    transfer.receivedByBranch = currentBranch.id;
 
-    writeTransfers(transfers);
+    transfer.receivedStoreId = currentStoreId;
 
-    res.json({
+    /**
+     * Информация о списании недостачи
+     */
+
+    transfer.shortageLoss = shortageLoss;
+
+    transfer.shortageLossId = shortageLoss?.id || null;
+
+    transfer.shortageLossHref = shortageLoss?.href || null;
+    transfer.excessSupply = excessSupply;
+
+    transfer.excessSupplyId = excessSupply?.id || null;
+
+    transfer.excessSupplyHref = excessSupply?.href || null;
+    /**
+     * Сохраняем запись.
+     */
+
+    transfersStorage[foundBranchKey][foundIndex] = transfer;
+
+    writeTransfers(transfersStorage);
+
+    return res.json({
       success: true,
+
       transfer,
+
+      shortage: {
+        quantity: totalShortageQuantity,
+
+        loss: shortageLoss,
+      },
+
+      excess: {
+        quantity: totalExcessQuantity,
+
+        supply: excessSupply,
+      },
     });
   } catch (error) {
     console.error("POST /api/transfers/:id/confirm:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       message: error.message || "Не удалось подтвердить перемещение",
     });
   }
@@ -1069,14 +1998,6 @@ router.post("/:id/confirm", (req, res) => {
 /**
  * ----------------------------------------------------
  * GET /api/transfers/config
- *
- * Небольшой диагностический endpoint.
- *
- * Позволит проверить:
- * - авторизацию
- * - организацию
- * - склады
- * - текущего контрагента
  * ----------------------------------------------------
  */
 
@@ -1098,13 +2019,34 @@ router.get("/config", async (req, res) => {
       }
     }
 
+    let branch = null;
+
+    try {
+      const currentBranch = getCurrentBranch();
+
+      branch = {
+        key: getBranchKey(currentBranch),
+
+        storeId: currentBranch.storeId || null,
+
+        retailStoreId: currentBranch.retailStoreId || null,
+
+        name: currentBranch.name || null,
+      };
+    } catch {
+      branch = null;
+    }
+
     res.json({
       success: true,
 
       auth: {
         loginConfigured: Boolean(LOGIN),
+
         passwordConfigured: Boolean(PASSWORD),
       },
+
+      branch,
 
       retailStoreId: RETAIL_STORE_ID || null,
 
@@ -1117,13 +2059,17 @@ router.get("/config", async (req, res) => {
 
       organizations: (organizations.rows || []).map((organization) => ({
         id: organization.id,
+
         name: organization.name,
       })),
 
       stores: (stores.rows || []).map((store) => ({
         id: store.id,
+
         name: store.name,
+
         code: store.code || null,
+
         pathName: store.pathName || "",
       })),
     });

@@ -3,19 +3,43 @@ const cors = require("cors");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { getCurrentBranch } = require("./branchContext");
+
 require("dotenv").config();
+
+const { router: authRouter, requireAuth } = require("./auth");
 
 const app = express();
 
 app.use(
   cors({
-    origin: ["http://localhost:3000","http://localhost:3001", "https://runo-rouge.vercel.app"],
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "https://runo.kg",
+    ],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 
 app.use(express.json());
+
+// ========================================
+// AUTH
+// ========================================
+
+// Авторизация доступна без авторизации
+app.use("/api/auth", authRouter);
+
+// ========================================
+// PROTECTED API
+// ========================================
+
+// Всё остальное API требует входа
+app.use("/api", requireAuth);
+
 const writeoffRouter = require("./writeoff.routes");
 const personnelRouter = require("./personnel");
 
@@ -45,13 +69,9 @@ const AGENT = process.env.MOYSKLAD_AGENT;
 const LOGIN = process.env.MOYSKLAD_LOGIN;
 const PASSWORD = process.env.MOYSKLAD_PASSWORD;
 
-const RETAIL_STORE_ID = process.env.MOYSKLAD_RETAIL_STORE_ID;
-
 const MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2";
 
 const MOYSKLAD_POS_API = "https://online.moysklad.ru/api/posap/1.0";
-
-const YOUNG_GUARD_ID = "40b43662-2117-11f1-0a80-1cb200302c3c";
 
 const reservationsRouter = require("./reservations.routes");
 
@@ -70,91 +90,172 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// Создаем sales.json
-// ВАЖНО: теперь начальная структура — объект {}, а не []
-if (!fs.existsSync(SALES_FILE)) {
-  fs.writeFileSync(SALES_FILE, JSON.stringify({}, null, 2), "utf8");
+// =========================================================
+// BRANCH LOCAL JSON STORAGE
+// =========================================================
+
+const DEFAULT_BRANCHES = ["bishkek", "dordoy", "osh"];
+
+function getBranchKey() {
+  const branch = getCurrentBranch();
+
+  if (!branch?.id) {
+    throw new Error("Текущий филиал не определён");
+  }
+
+  return String(branch.id).toLowerCase();
 }
 
-// =========================================================
-// READ SALES
-// =========================================================
-
-function readSales() {
+/**
+ * Читает JSON-файл целиком.
+ *
+ * Новый формат:
+ * {
+ *   bishkek: ...,
+ *   dordoy: ...,
+ *   osh: ...
+ * }
+ */
+function readBranchJson(filePath, defaultValue) {
   try {
-    const content = fs.readFileSync(SALES_FILE, "utf8");
+    if (!fs.existsSync(filePath)) {
+      return {};
+    }
+
+    const content = fs.readFileSync(filePath, "utf8");
 
     if (!content.trim()) {
       return {};
     }
 
-    const sales = JSON.parse(content);
+    const data = JSON.parse(content);
 
-    // Новый формат:
-    // {
-    //   "2026-09-23": [],
-    //   "2026-09-22": []
-    // }
-
-    if (sales && typeof sales === "object" && !Array.isArray(sales)) {
-      return sales;
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return {};
     }
 
-    // Если старый формат был массивом,
-    // возвращаем пустой объект.
-    return {};
+    return data;
   } catch (error) {
-    console.error("Ошибка чтения sales.json:", error);
+    console.error(`Ошибка чтения ${filePath}:`, error);
 
     return {};
   }
 }
-// =========================================================
-// READ SALESPERSONS
-// =========================================================
+
+/**
+ * Получить данные только текущего филиала.
+ */
+function readBranchData(filePath, defaultValue) {
+  const allData = readBranchJson(filePath, defaultValue);
+
+  const branchKey = getBranchKey();
+
+  if (
+    !Object.prototype.hasOwnProperty.call(allData, branchKey) ||
+    allData[branchKey] === undefined ||
+    allData[branchKey] === null
+  ) {
+    return defaultValue;
+  }
+
+  return allData[branchKey];
+}
+
+/**
+ * Записать данные только текущего филиала,
+ * сохранив остальные филиалы.
+ */
+function writeBranchData(filePath, value, defaultValue) {
+  const allData = readBranchJson(filePath, defaultValue);
+
+  const branchKey = getBranchKey();
+
+  allData[branchKey] = value;
+
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify(allData, null, 2),
+    "utf8",
+  );
+
+  return value;
+}
+
+if (!fs.existsSync(SALES_FILE)) {
+  fs.writeFileSync(SALES_FILE, JSON.stringify({}, null, 2), "utf8");
+}
+function getDefaultCashData() {
+  return {
+    balance: 0,
+    transactions: [],
+  };
+}
+
+function readSales() {
+  try {
+    return readBranchData(
+      SALES_FILE,
+      {},
+    );
+  } catch (error) {
+    console.error("Ошибка чтения продаж текущего филиала:", error);
+
+    return {};
+  }
+}
 
 function readSalespersons() {
   try {
-    if (!fs.existsSync(SALESPERSONS_FILE)) {
-      return [];
-    }
-
-    const content = fs.readFileSync(SALESPERSONS_FILE, "utf8");
-
-    if (!content.trim()) {
-      return [];
-    }
-
-    const salespersons = JSON.parse(content);
-
-    if (!Array.isArray(salespersons)) {
-      console.error("personnel.json должен содержать массив продавцов");
-      return [];
-    }
-
-    return salespersons;
+    return readBranchData(
+      SALESPERSONS_FILE,
+      [],
+    );
   } catch (error) {
-    console.error("Ошибка чтения personnel.json:", error);
+    console.error(
+      "Ошибка чтения продавцов текущего филиала:",
+      error,
+    );
 
     return [];
   }
 }
-// =========================================================
-// WRITE SALES
-// =========================================================
 
 function writeSales(sales) {
-  fs.writeFileSync(SALES_FILE, JSON.stringify(sales, null, 2), "utf8");
+  try {
+    writeBranchData(
+      SALES_FILE,
+      sales,
+      {},
+    );
+  } catch (error) {
+    console.error("Ошибка записи продаж текущего филиала:", error);
+
+    throw error;
+  }
 }
+
 
 async function sendTelegramCancellationNotification(sale) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+   const branch = getCurrentBranch();
+   const branchKey = String(branch.id).toLowerCase();
+
+    // Новый формат:
+    // {
+    //   bishkek: {...},
+    //   dordoy: {...},
+    //   osh: {...}
+    // }
+    const telegramChatIds = {
+  bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
+  dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
+  osh: process.env.TELEGRAM_CHAT_ID_OSH,
+};
+
+const chatId = telegramChatIds[branchKey];
+  // const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!botToken || !chatId) {
-    console.log(
-      "Telegram уведомление пропущено: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не указаны",
-    );
     return;
   }
 
@@ -231,53 +332,20 @@ async function sendTelegramCancellationNotification(sale) {
 
     throw new Error(`Telegram ${response.status}: ${errorText}`);
   }
-
-  console.log("Telegram уведомление об отмене продажи отправлено");
 }
-
-// =========================================================
-// SAVE SALE
-// =========================================================
 
 function saveSale(sale) {
   try {
     const salesByDate = readSales();
 
-    // -----------------------------------------------------
-    // Определяем дату продажи
-    // -----------------------------------------------------
-
     const date = sale.createdAt
       ? sale.createdAt.slice(0, 10)
       : new Date().toISOString().slice(0, 10);
-
-    // -----------------------------------------------------
-    // Создаем массив продаж за этот день
-    // -----------------------------------------------------
-
     if (!Array.isArray(salesByDate[date])) {
       salesByDate[date] = [];
     }
-
-    // -----------------------------------------------------
-    // Добавляем продажу
-    // -----------------------------------------------------
-
     salesByDate[date].push(sale);
-
-    // -----------------------------------------------------
-    // Сохраняем
-    // -----------------------------------------------------
-
     writeSales(salesByDate);
-
-    console.log("================================");
-    console.log("ЛОКАЛЬНАЯ ПРОДАЖА СОХРАНЕНА");
-    console.log("Файл:", SALES_FILE);
-    console.log("Дата:", date);
-    console.log("ID:", sale.id);
-    console.log("Продаж за этот день:", salesByDate[date].length);
-    console.log("================================");
 
     return sale;
   } catch (error) {
@@ -286,33 +354,189 @@ function saveSale(sale) {
     throw error;
   }
 }
+function readCash() {
+  try {
+    const content = fs.readFileSync(CASH_FILE, "utf8");
 
+    if (!content.trim()) {
+      return {
+        balance: 0,
+        transactions: [],
+      };
+    }
+
+    const allCash = JSON.parse(content);
+
+    const branch = getCurrentBranch();
+
+    if (!branch?.id) {
+      throw new Error("Текущий филиал не определён");
+    }
+
+    const branchKey = String(branch.id).toLowerCase();
+
+    // Новый формат:
+    // {
+    //   bishkek: {...},
+    //   dordoy: {...},
+    //   osh: {...}
+    // }
+    if (
+      allCash &&
+      typeof allCash === "object" &&
+      !Array.isArray(allCash) &&
+      (
+        Object.prototype.hasOwnProperty.call(allCash, "bishkek") ||
+        Object.prototype.hasOwnProperty.call(allCash, "dordoy") ||
+        Object.prototype.hasOwnProperty.call(allCash, "osh")
+      )
+    ) {
+      if (!allCash[branchKey]) {
+        allCash[branchKey] = {
+          balance: 0,
+          transactions: [],
+        };
+
+        fs.writeFileSync(
+          CASH_FILE,
+          JSON.stringify(allCash, null, 2),
+          "utf8"
+        );
+      }
+
+      return allCash[branchKey];
+    }
+
+    // Старый формат:
+    // {
+    //   balance: 1000,
+    //   transactions: [...]
+    // }
+    // Автоматически переносим его в текущий филиал.
+    const migrated = {
+      bishkek: {
+        balance: 0,
+        transactions: [],
+      },
+      dordoy: {
+        balance: 0,
+        transactions: [],
+      },
+      osh: {
+        balance: 0,
+        transactions: [],
+      },
+    };
+
+    if (
+      allCash &&
+      typeof allCash === "object" &&
+      !Array.isArray(allCash) &&
+      (
+        typeof allCash.balance === "number" ||
+        Array.isArray(allCash.transactions)
+      )
+    ) {
+      migrated[branchKey] = {
+        balance: Number(allCash.balance) || 0,
+        transactions: Array.isArray(allCash.transactions)
+          ? allCash.transactions
+          : [],
+      };
+    }
+
+    fs.writeFileSync(
+      CASH_FILE,
+      JSON.stringify(migrated, null, 2),
+      "utf8"
+    );
+
+    return migrated[branchKey];
+  } catch (error) {
+    console.error("readCash Ошибка:", error);
+
+    return {
+      balance: 0,
+      transactions: [],
+    };
+  }
+}
+
+
+function writeCash(cash) {
+  try {
+    const branch = getCurrentBranch();
+
+    if (!branch?.id) {
+      throw new Error("Текущий филиал не определён");
+    }
+
+    const branchKey = String(branch.id).toLowerCase();
+
+    let allCash = {};
+
+    try {
+      const content = fs.readFileSync(CASH_FILE, "utf8");
+
+      if (content.trim()) {
+        allCash = JSON.parse(content);
+      }
+    } catch {
+      allCash = {};
+    }
+
+    // Если старый формат — создаём новый
+    if (
+      !allCash ||
+      typeof allCash !== "object" ||
+      Array.isArray(allCash) ||
+      (
+        !Object.prototype.hasOwnProperty.call(allCash, "bishkek") &&
+        !Object.prototype.hasOwnProperty.call(allCash, "dordoy") &&
+        !Object.prototype.hasOwnProperty.call(allCash, "osh")
+      )
+    ) {
+      allCash = {
+        bishkek: {
+          balance: 0,
+          transactions: [],
+        },
+        dordoy: {
+          balance: 0,
+          transactions: [],
+        },
+        osh: {
+          balance: 0,
+          transactions: [],
+        },
+      };
+    }
+
+    // Записываем ТОЛЬКО текущий филиал
+    allCash[branchKey] = cash;
+
+    fs.writeFileSync(
+      CASH_FILE,
+      JSON.stringify(allCash, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.error("writeCash Ошибка:", error);
+    throw error;
+  }
+}
 // =========================================================
 // ADD SALE CASH TO CASH.JSON
 // =========================================================
 
 function addSaleToCash(cashSum, salesperson, orderId = null) {
   try {
-    // Если наличной оплаты нет — ничего не делаем
     if (!cashSum || cashSum <= 0) {
       return null;
     }
 
-    // Читаем cash.json
-    let cashData = {
-      balance: 0,
-      transactions: [],
-    };
+    const cashData = readCash();
 
-    if (fs.existsSync(CASH_FILE)) {
-      const content = fs.readFileSync(CASH_FILE, "utf8");
-
-      if (content.trim()) {
-        cashData = JSON.parse(content);
-      }
-    }
-
-    // Проверяем структуру
     if (!Array.isArray(cashData.transactions)) {
       cashData.transactions = [];
     }
@@ -321,17 +545,12 @@ function addSaleToCash(cashSum, salesperson, orderId = null) {
       cashData.balance = 0;
     }
 
-    // cashSum приходит в копейках
-    // Баланс cash.json хранится в сомах
     const amountSom = cashSum / 100;
 
-    // Баланс до операции
     const balanceBefore = cashData.balance;
 
-    // Новый баланс
     const balanceAfter = balanceBefore + amountSom;
 
-    // Создаём историю транзакции
     const transaction = {
       id: `CASH-SALE-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
 
@@ -343,7 +562,6 @@ function addSaleToCash(cashSum, salesperson, orderId = null) {
 
       balanceAfter,
 
-      // Связь с продажей
       orderId: orderId || null,
 
       responsible:
@@ -356,23 +574,11 @@ function addSaleToCash(cashSum, salesperson, orderId = null) {
       createdAt: new Date().toISOString(),
     };
 
-    // Обновляем баланс
     cashData.balance = balanceAfter;
 
-    // Добавляем транзакцию
     cashData.transactions.push(transaction);
 
-    // Сохраняем cash.json
-    fs.writeFileSync(CASH_FILE, JSON.stringify(cashData, null, 2), "utf8");
-
-    console.log("================================");
-    console.log("НАЛИЧНАЯ ОПЛАТА ДОБАВЛЕНА В КАССУ");
-    console.log("Сумма:", amountSom, "сом");
-    console.log("Order ID:", orderId);
-    console.log("Баланс до:", balanceBefore);
-    console.log("Баланс после:", balanceAfter);
-    console.log("Транзакция:", transaction.id);
-    console.log("================================");
+    writeCash(cashData);
 
     return transaction;
   } catch (error) {
@@ -398,18 +604,7 @@ function addReturnToCash(
       return null;
     }
 
-    let cashData = {
-      balance: 0,
-      transactions: [],
-    };
-
-    if (fs.existsSync(CASH_FILE)) {
-      const content = fs.readFileSync(CASH_FILE, "utf8");
-
-      if (content.trim()) {
-        cashData = JSON.parse(content);
-      }
-    }
+    const cashData = readCash();
 
     if (!Array.isArray(cashData.transactions)) {
       cashData.transactions = [];
@@ -422,6 +617,7 @@ function addReturnToCash(
     const amountSom = cashSum / 100;
 
     const balanceBefore = cashData.balance;
+
     const balanceAfter = balanceBefore - amountSom;
 
     const transaction = {
@@ -434,6 +630,7 @@ function addReturnToCash(
       amount: -amountSom,
 
       balanceBefore,
+
       balanceAfter,
 
       orderId: orderId || null,
@@ -442,7 +639,9 @@ function addReturnToCash(
 
       returnDocumentId: returnDocumentId || null,
 
-      comment: isCancellation ? "Отмена платежа" : "Возврат денег за товар",
+      comment: isCancellation
+        ? "Отмена платежа"
+        : "Возврат денег за товар",
 
       createdAt: new Date().toISOString(),
     };
@@ -451,14 +650,7 @@ function addReturnToCash(
 
     cashData.transactions.push(transaction);
 
-    fs.writeFileSync(CASH_FILE, JSON.stringify(cashData, null, 2), "utf8");
-
-    console.log(
-      isCancellation
-        ? "Отмена платежа записана в кассу:"
-        : "Возврат записан в кассу:",
-      transaction.id,
-    );
+    writeCash(cashData);
 
     return transaction;
   } catch (error) {
@@ -472,22 +664,36 @@ function addReturnToCash(
     throw error;
   }
 }
+function readReturns() {
+  try {
+    return readBranchData(
+      RETURNS_FILE,
+      [],
+    );
+  } catch (error) {
+    console.error("Ошибка чтения returns.json:", error);
 
-// =========================================================
-// GET LOCAL SALES
-// =========================================================
+    return [];
+  }
+}
 
-// =========================================================
-// GET LOCAL SALES
-// =========================================================
+function writeReturns(returns) {
+  try {
+    writeBranchData(
+      RETURNS_FILE,
+      returns,
+      [],
+    );
+  } catch (error) {
+    console.error("Ошибка записи returns.json:", error);
+
+    throw error;
+  }
+}
 
 app.get("/api/moysklad/sales", (req, res) => {
   try {
     const salesByDate = readSales();
-
-    // -----------------------------------------------------
-    // Превращаем продажи из объекта в единый массив
-    // -----------------------------------------------------
 
     const allSales = Object.entries(salesByDate).flatMap(([date, sales]) =>
       sales.map((sale) => ({
@@ -495,10 +701,6 @@ app.get("/api/moysklad/sales", (req, res) => {
         date,
       })),
     );
-
-    // -----------------------------------------------------
-    // Сортируем от новых к старым
-    // -----------------------------------------------------
 
     const sortedSales = allSales.sort(
       (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
@@ -531,18 +733,25 @@ app.use("/api/reservations", reservationsRouter);
 let moySkladToken = null;
 let moySkladOrganization = null;
 
-let posAuthToken = null;
-let posCashierUid = null;
+const posAuthCache = new Map();
+// let posCashierUid = null;
 
 /* =========================================================
    POS AUTH
 ========================================================= */
 
 async function getPosAuth() {
-  if (posAuthToken && posCashierUid) {
+  const branch = getCurrentBranch();
+
+  const branchId = branch.id;
+  const retailStoreId = branch.retailStoreId;
+
+  const cached = posAuthCache.get(branchId);
+
+  if (cached?.token && cached?.uid) {
     return {
-      token: posAuthToken,
-      uid: posCashierUid,
+      token: cached.token,
+      uid: cached.uid,
     };
   }
 
@@ -550,16 +759,16 @@ async function getPosAuth() {
     throw new Error("MOYSKLAD_LOGIN или MOYSKLAD_PASSWORD не указаны в .env");
   }
 
-  if (!RETAIL_STORE_ID) {
-    throw new Error("MOYSKLAD_RETAIL_STORE_ID не указан в .env");
+  if (!retailStoreId) {
+    throw new Error(
+      `MOYSKLAD_RETAIL_STORE_ID для филиала ${branch.name} не указан`,
+    );
   }
-
-  console.log("Получаем POS token МойСклад...");
 
   const credentials = Buffer.from(`${LOGIN}:${PASSWORD}`).toString("base64");
 
   const response = await fetch(
-    `${MOYSKLAD_POS_API}/admin/attach/${RETAIL_STORE_ID}`,
+    `${MOYSKLAD_POS_API}/admin/attach/${retailStoreId}`,
     {
       method: "POST",
 
@@ -574,30 +783,30 @@ async function getPosAuth() {
     const errorText = await response.text();
 
     throw new Error(
-      `Ошибка получения POS token: ${response.status} ${errorText}`,
+      `Ошибка получения POS token для филиала ${branch.name}: ${response.status} ${errorText}`,
     );
   }
 
   const data = await response.json();
 
   if (!data.token) {
-    throw new Error("МойСклад не вернул POS token");
+    throw new Error(`МойСклад не вернул POS token для филиала ${branch.name}`);
   }
 
   if (!data.uid) {
-    throw new Error("МойСклад не вернул UID кассира");
+    throw new Error(
+      `МойСклад не вернул UID кассира для филиала ${branch.name}`,
+    );
   }
 
-  posAuthToken = data.token;
-  posCashierUid = data.uid;
-
-  console.log("POS token успешно получен");
-
-  console.log("POS cashier UID:", posCashierUid);
+  posAuthCache.set(branchId, {
+    token: data.token,
+    uid: data.uid,
+  });
 
   return {
-    token: posAuthToken,
-    uid: posCashierUid,
+    token: data.token,
+    uid: data.uid,
   };
 }
 
@@ -608,23 +817,13 @@ async function getPosAuth() {
 async function openRetailShift() {
   const { token, uid } = await getPosAuth();
 
+  const branch = getCurrentBranch();
+  const retailStoreId = branch.retailStoreId;
   const retailShiftSyncId = crypto.randomUUID();
 
   const shiftName = `POS-${Date.now()}`;
 
   const openMoment = new Date().toISOString().slice(0, 19).replace("T", " ");
-
-  console.log("================================");
-
-  console.log("ОТКРЫТИЕ СМЕНЫ");
-
-  console.log("retailStore:", RETAIL_STORE_ID);
-
-  console.log("retailShiftSyncId:", retailShiftSyncId);
-
-  console.log("shiftName:", shiftName);
-
-  console.log("cashierUid:", uid);
 
   const response = await fetch(`${MOYSKLAD_POS_API}/rpc/openshift/`, {
     method: "PUT",
@@ -654,18 +853,13 @@ async function openRetailShift() {
     const errorText = await response.text();
 
     if (response.status === 401 || response.status === 403) {
-      posAuthToken = null;
-      posCashierUid = null;
+      posAuthCache.delete(branch.id);
     }
 
     throw new Error(
       `Ошибка открытия смены МойСклад: ${response.status} ${errorText}`,
     );
   }
-
-  console.log("Смена успешно открыта");
-
-  console.log("================================");
 
   return {
     success: true,
@@ -676,30 +870,20 @@ async function openRetailShift() {
 
     openMoment,
 
-    retailStoreId: RETAIL_STORE_ID,
+    retailStoreId,
   };
 }
-
-/* =========================================================
-   CLOSE RETAIL SHIFT
-========================================================= */
 
 async function closeRetailShift(retailShiftSyncId) {
   if (!retailShiftSyncId) {
     throw new Error("Не указан retailShiftSyncId");
   }
+  const branch = getCurrentBranch();
+  const retailStoreId = branch.retailStoreId;
 
   const { token, uid } = await getPosAuth();
 
   const closeMoment = new Date().toISOString().slice(0, 19).replace("T", " ");
-
-  console.log("================================");
-
-  console.log("ЗАКРЫТИЕ СМЕНЫ");
-
-  console.log("retailShiftSyncId:", retailShiftSyncId);
-
-  console.log("cashierUid:", uid);
 
   const response = await fetch(`${MOYSKLAD_POS_API}/rpc/closeshift/`, {
     method: "PUT",
@@ -727,18 +911,13 @@ async function closeRetailShift(retailShiftSyncId) {
     const errorText = await response.text();
 
     if (response.status === 401 || response.status === 403) {
-      posAuthToken = null;
-      posCashierUid = null;
+      posAuthCache.delete(branch.id);
     }
 
     throw new Error(
       `Ошибка закрытия смены МойСклад: ${response.status} ${errorText}`,
     );
   }
-
-  console.log("Смена успешно закрыта");
-
-  console.log("================================");
 
   return {
     success: true,
@@ -747,13 +926,9 @@ async function closeRetailShift(retailShiftSyncId) {
 
     closeMoment,
 
-    retailStoreId: RETAIL_STORE_ID,
+    retailStoreId,
   };
 }
-
-/* =========================================================
-   MOYSKLAD AUTH
-========================================================= */
 
 async function authorizeMoySklad() {
   if (!LOGIN || !PASSWORD) {
@@ -784,8 +959,6 @@ async function authorizeMoySklad() {
 
   moySkladToken = data.access_token;
 
-  console.log("Авторизация в МойСклад успешна");
-
   return moySkladToken;
 }
 
@@ -811,8 +984,6 @@ async function moySkladRequest(path, options = {}) {
   });
 
   if (response.status === 401) {
-    console.log("Получаем новый токен МойСклад...");
-
     moySkladToken = null;
 
     await authorizeMoySklad();
@@ -858,8 +1029,6 @@ async function deleteMoySkladRetailDemand(id) {
 
   // Если токен устарел — получаем новый и повторяем DELETE
   if (response.status === 401) {
-    console.log("Получаем новый токен МойСклад...");
-
     moySkladToken = null;
 
     await authorizeMoySklad();
@@ -883,10 +1052,6 @@ async function deleteMoySkladRetailDemand(id) {
   return true;
 }
 
-/* =========================================================
-   HEALTH
-========================================================= */
-
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -894,10 +1059,6 @@ app.get("/api/health", (req, res) => {
     message: "Backend работает",
   });
 });
-
-/* =========================================================
-   OPEN SHIFT
-========================================================= */
 
 app.post("/api/moysklad/retail-shift/open", async (req, res) => {
   try {
@@ -951,8 +1112,6 @@ app.post("/api/moysklad/retail-shift/close", async (req, res) => {
 
 app.get("/api/moysklad/stores", async (req, res) => {
   try {
-    console.log("Получаем список складов...");
-
     const data = await moySkladRequest("/entity/store?limit=100");
 
     const stores = (data.rows || []).map((store) => ({
@@ -964,8 +1123,6 @@ app.get("/api/moysklad/stores", async (req, res) => {
 
       address: store.address || "",
     }));
-
-    console.log(`Получено складов: ${stores.length}`);
 
     return res.json({
       rows: stores,
@@ -1005,8 +1162,6 @@ app.get("/api/moysklad/stores/:storeId", async (req, res) => {
 
 app.get("/api/moysklad/retail-stores", async (req, res) => {
   try {
-    console.log("Получаем розничные точки...");
-
     const data = await moySkladRequest("/entity/retailstore?limit=100");
 
     const retailStores = (data.rows || []).map((retailStore) => ({
@@ -1020,8 +1175,6 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
 
       meta: retailStore.meta || null,
     }));
-
-    console.log(`Получено розничных точек: ${retailStores.length}`);
 
     return res.json({
       total: retailStores.length,
@@ -1037,14 +1190,6 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
   }
 });
 
-/* =========================================================
-   PRODUCTS
-========================================================= */
-
-/* =========================================================
-   РАССЧИТАТЬ ОСТАТОК КОМПЛЕКТА
-========================================================= */
-
 async function calculateBundleStock(bundle, stockRows) {
   try {
     const bundleId = bundle.id;
@@ -1056,8 +1201,6 @@ async function calculateBundleStock(bundle, stockRows) {
     const components = await getBundleComponents(bundleId);
 
     if (components.length === 0) {
-      console.log(`Комплект "${bundle.name}" не имеет компонентов`);
-
       return 0;
     }
 
@@ -1081,17 +1224,9 @@ async function calculateBundleStock(bundle, stockRows) {
         return 0;
       }
 
-      /*
-       * ID товара/модификации
-       */
-
       const componentHref = componentMeta.href.split("?")[0];
 
       const componentId = componentHref.split("/").pop();
-
-      /*
-       * Ищем остаток компонента
-       */
 
       const stockItem = stockRows.find((item) => {
         const href = item.meta?.href?.split("?")[0];
@@ -1181,6 +1316,8 @@ async function getAllMoySkladRows(path, pageSize = 1000) {
   while (true) {
     const separator = path.includes("?") ? "&" : "?";
 
+    const requestPath = `${path}${separator}limit=${pageSize}&offset=${offset}`;
+
     const data = await moySkladRequest(
       `${path}${separator}limit=${pageSize}&offset=${offset}`,
     );
@@ -1188,10 +1325,6 @@ async function getAllMoySkladRows(path, pageSize = 1000) {
     const rows = data?.rows || [];
 
     allRows.push(...rows);
-
-    console.log(
-      `MOYSKLAD: ${path} offset=${offset}, получено=${rows.length}, всего=${allRows.length}`,
-    );
 
     if (rows.length < pageSize) {
       break;
@@ -1204,76 +1337,24 @@ async function getAllMoySkladRows(path, pageSize = 1000) {
 }
 async function refreshProductsCache(storeId) {
   if (productsLoading.has(storeId)) {
-    console.log(`PRODUCTS: обновление уже выполняется для ${storeId}`);
-
     return productsLoading.get(storeId);
   }
 
   const loadingPromise = (async () => {
     try {
-      console.log("================================");
-      console.log("ОБНОВЛЕНИЕ PRODUCTS");
-      console.log("Store:", storeId);
-      console.log("================================");
-
       const storeHref = `${MOYSKLAD_API}/entity/store/${storeId}`;
 
       const filterParam = encodeURIComponent(`store=${storeHref}`);
-
-      /*
-       * =================================================
-       * 1. ОСТАТКИ ПО СКЛАДУ
-       * =================================================
-       *
-       * Здесь получаем остатки отдельно.
-       * Отсутствие позиции здесь НЕ означает,
-       * что товара нет в каталоге.
-       */
 
       const stockRows = await getAllMoySkladRows(
         `/report/stock/all?filter=${filterParam}`,
       );
 
-      console.log(`Получено позиций с остатками: ${stockRows.length}`);
-
-      /*
-       * =================================================
-       * 2. ВСЕ ОБЫЧНЫЕ ТОВАРЫ
-       * =================================================
-       */
-
       const productRows = await getAllMoySkladRows(`/entity/product`);
-
-      console.log(`Получено обычных товаров: ${productRows.length}`);
-
-      /*
-       * =================================================
-       * 3. ВСЕ МОДИФИКАЦИИ
-       * =================================================
-       */
 
       const variantRows = await getAllMoySkladRows(`/entity/variant`);
 
-      console.log(`Получено модификаций: ${variantRows.length}`);
-
-      /*
-       * =================================================
-       * 4. ВСЕ КОМПЛЕКТЫ
-       * =================================================
-       */
-
       const bundles = await getAllMoySkladRows(`/entity/bundle`);
-
-      console.log(`Получено комплектов: ${bundles.length}`);
-
-      /*
-       * =================================================
-       * 5. СОЗДАЁМ MAP ОСТАТКОВ
-       * =================================================
-       *
-       * Чтобы не делать stockRows.find()
-       * для каждого товара.
-       */
 
       const stockMap = new Map();
 
@@ -1578,7 +1659,7 @@ async function refreshProductsCache(storeId) {
       const result = {
         storeId,
 
-        storeName: "Молодая Гвардия 41",
+        // storeName: "Молодая Гвардия 41",
 
         total: allProducts.length,
 
@@ -1603,14 +1684,6 @@ async function refreshProductsCache(storeId) {
         data: result,
       });
 
-      console.log("================================");
-      console.log("PRODUCTS CACHE ОБНОВЛЁН");
-      console.log("Обычных товаров:", products.length);
-      console.log("Модификаций:", variants.length);
-      console.log("Комплектов:", bundleProducts.length);
-      console.log("Всего:", allProducts.length);
-      console.log("================================");
-
       return result;
     } catch (error) {
       console.error("Ошибка обновления products:", error.message);
@@ -1626,29 +1699,25 @@ async function refreshProductsCache(storeId) {
   return loadingPromise;
 }
 
-async function forceRefreshProductsCache(storeId = YOUNG_GUARD_ID) {
-  console.log(`🔄 Принудительное обновление товаров: ${storeId}`);
-
-  try {
-    const data = await refreshProductsCache(storeId);
-
-    console.log(`✅ Кеш товаров обновлён: ${data?.rows?.length || 0} товаров`);
-
-    return {
-      success: true,
-      data,
-      cached: false,
-      cacheAge: 0,
-    };
-  } catch (error) {
-    console.error(`❌ Ошибка принудительного обновления кеша:`, error.message);
-
-    throw error;
+async function forceRefreshProductsCache(storeId) {
+  if (!storeId) {
+    throw new Error("Не указан storeId");
   }
+
+  const data = await refreshProductsCache(storeId);
+
+  return {
+    success: true,
+    data,
+    cached: false,
+    cacheAge: 0,
+  };
 }
 
 app.get("/api/moysklad/products", async (req, res) => {
-  const storeId = req.query.storeId || YOUNG_GUARD_ID;
+  const branch = getCurrentBranch();
+
+  const storeId = branch.storeId;
 
   const cached = productsCache.get(storeId);
 
@@ -1660,15 +1729,6 @@ app.get("/api/moysklad/products", async (req, res) => {
 
   if (cached) {
     const cacheAge = Date.now() - cached.timestamp;
-
-    console.log(
-      `PRODUCT CACHE: ${storeId}, возраст ${Math.round(cacheAge / 1000)} сек`,
-    );
-
-    /*
-     * Сразу отдаём старые данные.
-     * НИКОГДА не показываем белый экран.
-     */
 
     res.json({
       ...cached.data,
@@ -1732,7 +1792,8 @@ app.get("/api/moysklad/products", async (req, res) => {
 });
 
 app.post("/api/moysklad/products/refresh", async (req, res) => {
-  const storeId = req.body?.storeId || YOUNG_GUARD_ID;
+  const branch = getCurrentBranch();
+  const storeId = branch.storeId;
 
   try {
     const result = await forceRefreshProductsCache(storeId);
@@ -1764,9 +1825,6 @@ async function getMoySkladOrganization() {
   }
 
   moySkladOrganization = organization;
-
-  console.log("Организация МойСклад:", organization.name);
-
   return organization;
 }
 
@@ -1776,8 +1834,6 @@ async function getMoySkladOrganization() {
 
 app.get("/api/moysklad/counterparties", async (req, res) => {
   try {
-    console.log("Получаем список контрагентов...");
-
     const data = await moySkladRequest("/entity/counterparty?limit=1000");
 
     const counterparties = (data.rows || []).map((counterparty) => ({
@@ -1795,8 +1851,6 @@ app.get("/api/moysklad/counterparties", async (req, res) => {
 
       meta: counterparty.meta || null,
     }));
-
-    console.log(`Получено контрагентов: ${counterparties.length}`);
 
     return res.json({
       total: counterparties.length,
@@ -1865,22 +1919,13 @@ app.post("/api/moysklad/sales", async (req, res) => {
       payment,
       salespersonId,
       salesperson,
-
-      storeId = YOUNG_GUARD_ID,
-
       retailShiftSyncId,
     } = req.body;
 
-    console.log("================================");
+    const branch = getCurrentBranch();
 
-    console.log("Создание РОЗНИЧНОЙ ПРОДАЖИ:", orderId);
-
-    console.log("Сумма:", total);
-
-    console.log("Оплата:", payment);
-
-    console.log("Смена:", retailShiftSyncId);
-
+    const storeId = branch.storeId;
+    const retailStoreId = branch.retailStoreId;
     /* -----------------------------------------
          ПРОВЕРКА КОРЗИНЫ
       ----------------------------------------- */
@@ -1923,7 +1968,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
          RETAIL STORE
       ----------------------------------------- */
 
-    const retailStoreId = RETAIL_STORE_ID;
+    // const retailStoreId = branch.retailStoreId;
 
     if (!retailStoreId) {
       throw new Error("MOYSKLAD_RETAIL_STORE_ID не указан в .env");
@@ -2017,12 +2062,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
       `Итого: ${(normalizedTotal / 100).toFixed(2)} сом`,
     ].join("\n");
 
-    /* -----------------------------------------
-         ПОЛУЧАЕМ RETAIL SHIFT
-      ----------------------------------------- */
-
-    console.log("Ищем retailShift по syncId:", retailShiftSyncId);
-
     const shiftFilter = encodeURIComponent(`syncId=${retailShiftSyncId}`);
 
     const shiftData = await moySkladRequest(
@@ -2036,12 +2075,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
         `Розничная смена с syncId ${retailShiftSyncId} не найдена`,
       );
     }
-
-    console.log("Retail Shift native ID:", retailShift.id);
-
-    /* -----------------------------------------
-         RETAIL DEMAND
-      ----------------------------------------- */
 
     const retailDemandData = {
       name: orderId,
@@ -2108,28 +2141,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
     }
 
     /* -----------------------------------------
-         ЛОГ
-      ----------------------------------------- */
-
-    console.log("================================");
-
-    console.log("РОЗНИЧНАЯ ПРОДАЖА");
-
-    console.log("cashSum:", cashSum);
-
-    console.log("noCashSum:", noCashSum);
-
-    console.log("amanat:", normalizedPayment.amanat);
-
-    console.log("mplus:", normalizedPayment.mplus);
-
-    console.log("retailShift:", retailShift.id);
-
-    console.log("JSON:", JSON.stringify(retailDemandData, null, 2));
-
-    console.log("================================");
-
-    /* -----------------------------------------
          СОЗДАЁМ РОЗНИЧНУЮ ПРОДАЖУ
       ----------------------------------------- */
 
@@ -2142,8 +2153,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
 
       body: JSON.stringify(retailDemandData),
     });
-
-    console.log("Розничная продажа создана:", retailDemand.id);
 
     // =========================================================
     // СОХРАНЕНИЕ ПРОДАЖИ ЛОКАЛЬНО
@@ -2226,8 +2235,8 @@ app.post("/api/moysklad/sales", async (req, res) => {
       // retailStoreId: retailStoreId,
       // retailShiftSyncId: retailShiftSyncId,
       // retailShiftId: retailShift.id,
-      retailStoreId: "Боконбаева 222",
-      retailShiftSyncId: "Боконбаева 222",
+      retailStoreId,
+      retailShiftSyncId,
 
       // Склад
       storeId: storeId || null,
@@ -2266,13 +2275,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
         salesperson,
         localSale.orderId,
       );
-
-      console.log("Продажа сохранена локально:", localSale.id);
-
-      console.log(
-        "Транзакция кассы:",
-        cashTransaction?.id || "Без наличной оплаты",
-      );
     } catch (localSaveError) {
       console.error("Ошибка локального сохранения продажи:", localSaveError);
 
@@ -2291,8 +2293,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
         retailDemand,
       });
     }
-
-    console.log("================================");
 
     return res.status(201).json({
       success: true,
@@ -2316,8 +2316,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
     });
   } catch (error) {
     console.error("Ошибка создания розничной продажи:", error);
-
-    console.log("================================");
 
     return res.status(500).json({
       success: false,
@@ -2348,11 +2346,6 @@ app.post("/api/moysklad/sales", async (req, res) => {
 app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
   try {
     const { saleId } = req.params;
-
-    console.log("================================");
-    console.log("ОТМЕНА ПРОДАЖИ");
-    console.log("Sale ID:", saleId);
-    console.log("================================");
 
     // ---------------------------------------------------------
     // 1. Читаем существующие продажи
@@ -2387,8 +2380,6 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
     // ---------------------------------------------------------
 
     if (!foundSale) {
-      console.log("Продажа не найдена:", saleId);
-
       return res.status(404).json({
         success: false,
         error: "Продажа не найдена",
@@ -2417,21 +2408,11 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
         error: "У продажи отсутствует moyskladId",
       });
     }
-
-    console.log("Локальная продажа найдена");
-    console.log("Дата:", foundDate);
-    console.log("MoySklad ID:", foundSale.moyskladId);
-    console.log("Сумма:", foundSale.totalSom);
-
     // ---------------------------------------------------------
     // 5. УДАЛЯЕМ RETAILDEMAND ИЗ МОЙСКЛАДА
     // ---------------------------------------------------------
 
-    console.log("Удаляем retaildemand из МойСклад:", foundSale.moyskladId);
-
     await deleteMoySkladRetailDemand(foundSale.moyskladId);
-
-    console.log("Retaildemand успешно удалён из МойСклад");
 
     // ---------------------------------------------------------
     // 6. ОПРЕДЕЛЯЕМ НАЛИЧНУЮ ЧАСТЬ ПРОДАЖИ
@@ -2443,8 +2424,6 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
         : {};
 
     const cashSum = Number(payment.cash || 0);
-
-    console.log("Наличная часть продажи:", cashSum / 100, "сом");
 
     // ---------------------------------------------------------
     // 7. ЕСЛИ БЫЛА НАЛИЧКА — ВОЗВРАЩАЕМ ЕЁ В CASH
@@ -2507,13 +2486,6 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
       );
     }
 
-    console.log("================================");
-    console.log("ПРОДАЖА УСПЕШНО ОТМЕНЕНА");
-    console.log("Sale ID:", cancelledSale.id);
-    console.log("MoySklad ID:", cancelledSale.moyskladId);
-    console.log("Дата:", foundDate);
-    console.log("================================");
-
     // ---------------------------------------------------------
     // 12. Отправляем результат фронту
     // ---------------------------------------------------------
@@ -2524,11 +2496,6 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
       sale: cancelledSale,
     });
   } catch (error) {
-    console.error("================================");
-    console.error("ОШИБКА ОТМЕНЫ ПРОДАЖИ");
-    console.error(error);
-    console.error("================================");
-
     return res.status(500).json({
       success: false,
       error: error?.message || "Не удалось отменить продажу",
@@ -2559,11 +2526,11 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
       });
     }
 
-   const salespersons = readSalespersons();
+    const salespersons = readSalespersons();
 
-const salesperson = salespersons.find(
-  (item) => String(item.id) === String(salespersonId),
-);
+    const salesperson = salespersons.find(
+      (item) => String(item.id) === String(salespersonId),
+    );
 
     if (!salesperson) {
       return res.status(404).json({
@@ -2613,14 +2580,6 @@ const salesperson = salespersons.find(
     }
 
     writeSales(salesByDate);
-
-    console.log("================================");
-    console.log("ПРОДАВЕЦ ПРОДАЖИ ИЗМЕНЁН");
-    console.log("Продажа:", saleId);
-    console.log("Продавец:", salesperson.name);
-    console.log("ID продавца:", salesperson.id);
-    console.log("================================");
-
     return res.json({
       success: true,
       sale: updatedSale,
@@ -2642,187 +2601,249 @@ const salesperson = salespersons.find(
 app.listen(PORT, () => {
   console.log(`Backend запущен: http://localhost:${PORT}`);
 
-  console.log(`Retail Store ID: ${RETAIL_STORE_ID || "НЕ УКАЗАН"}`);
+  // console.log(`Retail Store ID: ${RETAIL_STORE_ID || "НЕ УКАЗАН"}`);
 });
 
 // возврат
 app.post("/api/moysklad/returns", async (req, res) => {
   try {
-    const {
-      items,
-      total,
-      retailShiftSyncId,
-      demandId,
-      orderId,
-      payment,
-      storeId = YOUNG_GUARD_ID,
-    } = req.body;
-    console.log("================================");
-    console.log("Создание РОЗНИЧНОГО ВОЗВРАТА");
-    console.log("Товары:", items);
-    console.log("Сумма:", total);
-    console.log("Смена:", retailShiftSyncId);
-    console.log("Исходная продажа:", demandId);
-    console.log("Оплата:", payment);
-    console.log("Склад:", storeId);
-    /* * ========================================== * ПРОВЕРКА ТОВАРОВ * ========================================== */ if (
-      !Array.isArray(items) ||
-      items.length === 0
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Нет товаров для возврата" });
+    const { items, total, retailShiftSyncId, demandId, orderId, payment } =
+      req.body;
+
+    const branch = getCurrentBranch();
+
+    const storeId = branch.storeId;
+    const retailStoreId = branch.retailStoreId;
+
+    /* ==========================================
+       ПРОВЕРКА ТОВАРОВ
+    ========================================== */
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Нет товаров для возврата",
+      });
     }
-    /* * ========================================== * ПРОВЕРКА КАССОВОЙ СМЕНЫ * ========================================== */ if (
-      !retailShiftSyncId
-    ) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Открытая кассовая смена не найдена",
-        });
+
+    /* ==========================================
+       ПРОВЕРКА КАССОВОЙ СМЕНЫ
+    ========================================== */
+
+    if (!retailShiftSyncId) {
+      return res.status(400).json({
+        success: false,
+        message: "Открытая кассовая смена не найдена",
+      });
     }
-    /* * ========================================== * ПРОВЕРКА СУММЫ * ========================================== */ if (
-      !Number.isFinite(Number(total)) ||
-      Number(total) <= 0
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Некорректная сумма возврата" });
+
+    if (!Number.isFinite(Number(total)) || Number(total) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Некорректная сумма возврата",
+      });
     }
+
     const normalizedTotal = Math.round(Number(total) * 100);
-    /* * ========================================== * ПРОВЕРКА СКЛАДА * ========================================== */ if (
-      !storeId
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Не указан склад" });
+
+    if (!storeId) {
+      return res.status(400).json({
+        success: false,
+        message: "Не указан склад",
+      });
     }
-    /* * ========================================== * ПРОВЕРКА РОЗНИЧНОЙ ТОЧКИ * ========================================== */ const retailStoreId =
-      RETAIL_STORE_ID;
+
     if (!retailStoreId) {
       throw new Error("MOYSKLAD_RETAIL_STORE_ID не указан в .env");
     }
-    /* * ========================================== * ПОЛУЧАЕМ ОРГАНИЗАЦИЮ * ========================================== */ const organization =
-      await getMoySkladOrganization();
-    /* * ========================================== * ПРОВЕРЯЕМ КОНТРАГЕНТА * ========================================== */ if (
-      !AGENT
-    ) {
+
+    const organization = await getMoySkladOrganization();
+
+    if (!AGENT) {
       throw new Error("MOYSKLAD_AGENT не указан в .env");
     }
-    /* * ========================================== * НАХОДИМ РОЗНИЧНУЮ СМЕНУ * ========================================== */ const shiftFilter =
-      encodeURIComponent(`syncId=${retailShiftSyncId}`);
+
+    const shiftFilter = encodeURIComponent(`syncId=${retailShiftSyncId}`);
+
     const shiftData = await moySkladRequest(
       `/entity/retailshift?filter=${shiftFilter}&limit=1`,
     );
+
     const retailShift = shiftData.rows?.[0];
+
     if (!retailShift) {
       throw new Error(
         `Розничная смена с syncId ${retailShiftSyncId} не найдена`,
       );
     }
-    /* * ========================================== * ОПРЕДЕЛЕНИЕ ТИПА АССОРТИМЕНТА * ========================================== * * Допустимые типы: * * product * bundle * * productfolder — это группа, НЕ ассортимент. * * Поэтому productfolder нельзя напрямую * передавать в positions.assortment. * * Backend сначала пытается использовать * указанный item.type, затем автоматически * проверяет product и bundle. */ const findAssortment =
-      async (item) => {
-        if (!item.id) {
-          throw new Error(
-            `У товара "${item.name || "Без названия"}" отсутствует ID МойСклад`,
-          );
-        }
-        /* * Типы, которые будем проверять. * * Если frontend передал корректный тип, * проверяем его первым. */ const requestedType =
-          typeof item.type === "string" ? item.type.toLowerCase() : null;
-        const typesToCheck = [];
-        if (requestedType === "product" || requestedType === "bundle") {
-          typesToCheck.push(requestedType);
-        }
-        /* * Если тип неизвестен или оказался неправильным, * автоматически пробуем оба типа. */ typesToCheck.push(
-          "product",
+
+    /* ==========================================
+       ПОИСК ASSORTMENT
+
+       Определяем, является ли позиция:
+       - product
+       - bundle
+
+       Если type пришёл с frontend,
+       сначала проверяем именно его.
+    ========================================== */
+
+    const findAssortment = async (item) => {
+      if (!item?.id) {
+        throw new Error(
+          `У товара "${item?.name || "Без названия"}" отсутствует ID МойСклад`,
         );
-        typesToCheck.push("bundle");
-        const uniqueTypes = [...new Set(typesToCheck)];
-        /* * Проверяем каждый тип через API МойСклад. */ for (const type of uniqueTypes) {
-          try {
-            const object = await moySkladRequest(`/entity/${type}/${item.id}`, {
-              method: "GET",
+      }
+
+      const requestedType =
+        typeof item.type === "string" ? item.type.toLowerCase() : null;
+
+      const typesToCheck = [];
+
+      /* ------------------------------------------
+         Если frontend передал правильный type,
+         проверяем его первым
+      ------------------------------------------ */
+
+      if (requestedType === "product" || requestedType === "bundle") {
+        typesToCheck.push(requestedType);
+      }
+
+      /* ------------------------------------------
+         Если type неизвестен —
+         пробуем оба варианта
+      ------------------------------------------ */
+
+      typesToCheck.push("product");
+      typesToCheck.push("bundle");
+
+      const uniqueTypes = [...new Set(typesToCheck)];
+
+      console.log(`Проверка ассортимента: "${item.name || "Без названия"}"`, {
+        id: item.id,
+        requestedType,
+        typesToCheck: uniqueTypes,
+      });
+
+      /* ==========================================
+         ПРОВЕРЯЕМ PRODUCT / BUNDLE
+      ========================================== */
+
+      for (const type of uniqueTypes) {
+        try {
+          console.log(`Проверяем ${type}: ${item.id}`);
+
+          const object = await moySkladRequest(`/entity/${type}/${item.id}`, {
+            method: "GET",
+          });
+
+          if (object?.id) {
+            console.log(`Найден assortment: ${type}`, {
+              id: object.id,
+              name: object.name,
             });
-            if (object?.id) {
-              console.log(`Ассортимент найден: ${type}`, {
-                id: object.id,
-                name: object.name,
-              });
-              return { id: object.id, type, object };
-            }
-          } catch (checkError) {
-            const errorData =
-              checkError?.response?.data || checkError?.data || null;
-            const errorCode =
-              errorData?.errors?.[0]?.code ||
-              checkError?.response?.status ||
-              checkError?.status ||
-              null;
-            console.log(
-              `Не найден как ${type}: ${item.id}`,
-              errorCode || checkError.message,
+
+            return {
+              id: object.id,
+              type,
+              object,
+            };
+          }
+        } catch (checkError) {
+          const errorData =
+            checkError?.response?.data || checkError?.data || null;
+
+          const errorCode =
+            errorData?.errors?.[0]?.code ||
+            checkError?.response?.status ||
+            checkError?.status ||
+            null;
+
+          console.log(`Не найден ${type}: ${item.id}`, {
+            errorCode,
+            error: errorData?.errors?.[0]?.error || checkError?.message || null,
+          });
+        }
+      }
+
+      /* ==========================================
+         ЕСЛИ FRONTEND ПРИСЛАЛ PRODUCTFOLDER
+      ========================================== */
+
+      if (requestedType === "productfolder") {
+        try {
+          const folder = await moySkladRequest(
+            `/entity/productfolder/${item.id}`,
+            {
+              method: "GET",
+            },
+          );
+
+          if (folder?.id) {
+            throw new Error(
+              `Объект "${item.name || folder.name || "Без названия"}" ` +
+                `является группой товаров (productfolder). ` +
+                `Группу нельзя вернуть как отдельную позицию. ` +
+                `Нужно передать ID конкретного товара или комплекта внутри группы.`,
             );
           }
-        }
-        /* * ========================================== * ЕСЛИ FRONTEND ПРИСЛАЛ PRODUCTFOLDER * ========================================== * * Группа товаров сама не может быть позицией * возврата. * * Но проверим, существует ли такая группа, * чтобы вернуть понятную ошибку. */ if (
-          requestedType === "productfolder"
-        ) {
-          try {
-            const folder = await moySkladRequest(
-              `/entity/productfolder/${item.id}`,
-              { method: "GET" },
-            );
-            if (folder?.id) {
-              throw new Error(
-                `Объект "${item.name || folder.name || "Без названия"}" ` +
-                  `является группой товаров (productfolder). ` +
-                  `Группу нельзя вернуть как отдельную позицию. ` +
-                  `Нужно передать ID конкретного товара или комплекта внутри группы.`,
-              );
-            }
-          } catch (folderError) {
-            /* * Если это наша понятная ошибка — * пробрасываем её дальше. */ if (
-              folderError.message &&
-              folderError.message.includes(
-                "Группу нельзя вернуть как отдельную позицию",
-              )
-            ) {
-              throw folderError;
-            }
+        } catch (folderError) {
+          if (
+            folderError.message &&
+            folderError.message.includes(
+              "Группу нельзя вернуть как отдельную позицию",
+            )
+          ) {
+            throw folderError;
           }
         }
-        /* * ========================================== * НЕ НАЙДЕНО * ========================================== */ throw new Error(
-          `Объект "${item.name || "Без названия"}" не найден в МойСклад. ` +
-            `ID: ${item.id}. ` +
-            `Тип из frontend: ${item.type || "не указан"}. ` +
-            `Ожидался product или bundle.`,
-        );
-      };
-    /* * ========================================== * ФОРМИРУЕМ ПОЗИЦИИ ВОЗВРАТА * ========================================== */ const positions =
-      [];
+      }
+
+      /* ==========================================
+         НЕ НАЙДЕНО
+      ========================================== */
+
+      throw new Error(
+        `Объект "${item.name || "Без названия"}" не найден в МойСклад. ` +
+          `ID: ${item.id}. ` +
+          `Тип из frontend: ${item.type || "не указан"}. ` +
+          `Ожидался product или bundle.`,
+      );
+    };
+
+    /* ==========================================
+       ФОРМИРУЕМ ПОЗИЦИИ ВОЗВРАТА
+    ========================================== */
+
+    const positions = [];
+
     for (const item of items) {
       const quantity = Number(item.quantity);
+
       if (!Number.isFinite(quantity) || quantity <= 0) {
         throw new Error(`Некорректное количество товара "${item.name || ""}"`);
       }
-      /* * Цена приходит с frontend в сомах. * * МойСклад принимает цену в копейках. */ const priceSom =
-        Number(item.price || 0);
+
+      /* ------------------------------------------
+         Цена приходит с frontend в сомах.
+         МойСклад принимает цену в копейках.
+      ------------------------------------------ */
+
+      const priceSom = Number(item.price || 0);
+
       if (!Number.isFinite(priceSom) || priceSom < 0) {
         throw new Error(`Некорректная цена товара "${item.name || ""}"`);
       }
+
       const price = Math.round(priceSom * 100);
-      /* * Автоматически определяем, * product это или bundle. */ const assortment =
-        await findAssortment(item);
-      console.log("Позиция возврата:", {
-        id: item.id,
-        name: item.name,
-        frontendType: item.type || null,
-        moySkladType: assortment.type,
-        quantity,
-        priceSom,
-      });
+
+      /* ------------------------------------------
+         Автоматически определяем:
+         product или bundle
+      ------------------------------------------ */
+
+      const assortment = await findAssortment(item);
+
       positions.push({
         quantity,
         price,
@@ -2835,52 +2856,82 @@ app.post("/api/moysklad/returns", async (req, res) => {
         },
       });
     }
-    /* * ========================================== * НОМЕР ВОЗВРАТА * ========================================== */ const returnId = `RETURN-${Date.now()}`;
-    /* * ========================================== * ДАННЫЕ ВОЗВРАТА * ========================================== */ const retailSalesReturnData =
-      {
-        name: returnId,
-        moment: new Date().toISOString().slice(0, 19).replace("T", " "),
-        description: `POS возврат${orderId ? `: ${orderId}` : ""}`,
-        /* * Организация */ organization: {
-          meta: {
-            href: organization.meta.href,
-            type: "organization",
-            mediaType: "application/json",
-          },
+
+    /* ==========================================
+       НОМЕР ВОЗВРАТА
+    ========================================== */
+
+    const returnId = `RETURN-${Date.now()}`;
+
+    /* ==========================================
+       ДАННЫЕ ВОЗВРАТА
+    ========================================== */
+
+    const retailSalesReturnData = {
+      name: returnId,
+
+      moment: new Date().toISOString().slice(0, 19).replace("T", " "),
+
+      description: `POS возврат${orderId ? `: ${orderId}` : ""}`,
+
+      /* Организация */
+
+      organization: {
+        meta: {
+          href: organization.meta.href,
+          type: "organization",
+          mediaType: "application/json",
         },
-        /* * Контрагент */ agent: {
-          meta: {
-            href: `${MOYSKLAD_API}/entity/counterparty/${AGENT}`,
-            type: "counterparty",
-            mediaType: "application/json",
-          },
+      },
+
+      /* Контрагент */
+
+      agent: {
+        meta: {
+          href: `${MOYSKLAD_API}/entity/counterparty/${AGENT}`,
+          type: "counterparty",
+          mediaType: "application/json",
         },
-        /* * Розничная точка */ retailStore: {
-          meta: {
-            href: `${MOYSKLAD_API}/entity/retailstore/${retailStoreId}`,
-            type: "retailstore",
-            mediaType: "application/json",
-          },
+      },
+
+      /* Розничная точка */
+
+      retailStore: {
+        meta: {
+          href: `${MOYSKLAD_API}/entity/retailstore/${retailStoreId}`,
+          type: "retailstore",
+          mediaType: "application/json",
         },
-        /* * Склад */ store: {
-          meta: {
-            href: `${MOYSKLAD_API}/entity/store/${storeId}`,
-            type: "store",
-            mediaType: "application/json",
-          },
+      },
+
+      /* Склад */
+
+      store: {
+        meta: {
+          href: `${MOYSKLAD_API}/entity/store/${storeId}`,
+          type: "store",
+          mediaType: "application/json",
         },
-        /* * Розничная смена */ retailShift: {
-          meta: {
-            href: `${MOYSKLAD_API}/entity/retailshift/${retailShift.id}`,
-            type: "retailshift",
-            mediaType: "application/json",
-          },
+      },
+
+      /* Розничная смена */
+
+      retailShift: {
+        meta: {
+          href: `${MOYSKLAD_API}/entity/retailshift/${retailShift.id}`,
+          type: "retailshift",
+          mediaType: "application/json",
         },
-        positions,
-      };
-    /* * ========================================== * СВЯЗЬ С ИСХОДНОЙ ПРОДАЖЕЙ * ========================================== */ if (
-      demandId
-    ) {
+      },
+
+      positions,
+    };
+
+    /* ==========================================
+       СВЯЗЬ С ИСХОДНОЙ ПРОДАЖЕЙ
+    ========================================== */
+
+    if (demandId) {
       retailSalesReturnData.demand = {
         meta: {
           href: `${MOYSKLAD_API}/entity/retaildemand/${demandId}`,
@@ -2889,9 +2940,14 @@ app.post("/api/moysklad/returns", async (req, res) => {
         },
       };
     }
-    /* * ========================================== * ОПЛАТА ВОЗВРАТА * ========================================== */ const cash =
-      Number(payment?.cash || 0);
+
+    /* ==========================================
+       ОПЛАТА ВОЗВРАТА
+    ========================================== */
+
+    const cash = Number(payment?.cash || 0);
     const card = Number(payment?.card || 0);
+
     if (
       !Number.isFinite(cash) ||
       !Number.isFinite(card) ||
@@ -2900,13 +2956,21 @@ app.post("/api/moysklad/returns", async (req, res) => {
     ) {
       throw new Error("Некорректные суммы возврата");
     }
-    /* * ========================================== * КОНВЕРТАЦИЯ В КОПЕЙКИ * ========================================== */ const cashSum =
-      Math.round(cash * 100);
+
+    /* ==========================================
+       КОНВЕРТАЦИЯ В КОПЕЙКИ
+    ========================================== */
+
+    const cashSum = Math.round(cash * 100);
     const noCashSum = Math.round(card * 100);
-    /* * ========================================== * ЕСЛИ PAYMENT НЕ ПЕРЕДАН * ========================================== */ if (
-      !payment
-    ) {
+
+    /* ==========================================
+       ЕСЛИ PAYMENT НЕ ПЕРЕДАН
+    ========================================== */
+
+    if (!payment) {
       retailSalesReturnData.cashSum = normalizedTotal;
+
       retailSalesReturnData.noCashSum = 0;
     } else {
       if (cashSum + noCashSum !== normalizedTotal) {
@@ -2917,30 +2981,44 @@ app.post("/api/moysklad/returns", async (req, res) => {
             `total=${normalizedTotal}`,
         );
       }
+
       retailSalesReturnData.cashSum = cashSum;
+
       retailSalesReturnData.noCashSum = noCashSum;
     }
-    /* * ========================================== * СУММА ДЛЯ ЛОКАЛЬНОЙ КАССЫ * ========================================== */ const localCashSum =
-      payment ? cashSum : normalizedTotal;
+
+    /* ==========================================
+       СУММА ДЛЯ ЛОКАЛЬНОЙ КАССЫ
+    ========================================== */
+
+    const localCashSum = payment ? cashSum : normalizedTotal;
+
+    /* ==========================================
+       СОЗДАЁМ ВОЗВРАТ В МОЙСКЛАД
+    ========================================== */
+
     console.log(
-      "Сумма возврата наличными для cash.json:",
-      localCashSum / 100,
-      "сом",
-    );
-    /* * ========================================== * СОЗДАЁМ ВОЗВРАТ В МОЙСКЛАД * ========================================== */ console.log(
       "ВОЗВРАТ JSON:",
       JSON.stringify(retailSalesReturnData, null, 2),
     );
+
     const retailSalesReturn = await moySkladRequest(
       "/entity/retailsalesreturn",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(retailSalesReturnData),
       },
     );
-    /* * ========================================== * СПИСЫВАЕМ ДЕНЬГИ ИЗ ЛОКАЛЬНОЙ КАССЫ * ========================================== */ let cashTransaction =
-      null;
+
+    /* ==========================================
+       СПИСЫВАЕМ ДЕНЬГИ ИЗ ЛОКАЛЬНОЙ КАССЫ
+    ========================================== */
+
+    let cashTransaction = null;
+
     if (localCashSum > 0) {
       cashTransaction = addReturnToCash(
         localCashSum,
@@ -2948,111 +3026,138 @@ app.post("/api/moysklad/returns", async (req, res) => {
         returnId,
         retailSalesReturn?.id || null,
       );
+
       console.log("Деньги за возврат списаны из кассы:", cashTransaction);
     } else {
       console.log("Возврат без наличных — cash.json не изменяется");
     }
-    /* * ========================================== * СОХРАНЯЕМ В data/returns.json * ========================================== */ const RETURNS_FILE =
-      path.join(DATA_DIR, "returns.json");
+
+    /* ==========================================
+       СОХРАНЯЕМ В data/returns.json
+    ========================================== */
+
+    const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
+
     if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    /* * Читаем существующие возвраты */ let returns = [];
-    if (fs.existsSync(RETURNS_FILE)) {
-      try {
-        const fileData = fs.readFileSync(RETURNS_FILE, "utf8");
-        if (fileData.trim()) {
-          returns = JSON.parse(fileData);
-        }
-        if (!Array.isArray(returns)) {
-          returns = [];
-        }
-      } catch (fileError) {
-        console.error("Ошибка чтения returns.json:", fileError);
-        returns = [];
-      }
-    }
-    /* * ========================================== * СОЗДАЁМ ЛОКАЛЬНУЮ ЗАПИСЬ * ========================================== */ const returnRecord =
-      {
-        id: returnId,
-        name: returnId,
-        date: new Date().toISOString(),
-        orderId: orderId || null,
-        demandId: demandId || null,
-        returnDocumentId: retailSalesReturn?.id || null,
-        retailShiftSyncId,
-        retailShiftId: retailShift.id,
-        storeId,
-        total: Number(total),
-        payment: { cash, card },
-        cashSum: localCashSum / 100,
-        noCashSum: payment ? noCashSum / 100 : 0,
-        items: items.map((item) => {
-          const quantity = Number(item.quantity);
-          const price = Number(item.price || 0);
-          return {
-            id: item.id,
-            name: item.name || "Без названия",
-            /* * Сохраняем тип, который * пришёл с frontend. * * Если его не было — * определяем по позиции. */ type:
-              item.type || "product",
-            quantity,
-            price,
-            sum: price * quantity,
-          };
-        }),
-      };
-    /* * Добавляем новый возврат */ returns.push(returnRecord);
-    /* * ========================================== * СОРТИРОВКА ПО ДАТЕ * ========================================== */ returns.sort(
-      (a, b) => {
-        return new Date(b.date).getTime() - new Date(a.date).getTime();
-      },
-    );
-    /* * ========================================== * СОХРАНЯЕМ returns.json * ========================================== */ fs.writeFileSync(
-      RETURNS_FILE,
-      JSON.stringify(returns, null, 2),
-      "utf8",
-    );
-    console.log("Возврат сохранён в returns.json:", returnRecord);
-    /* * ========================================== * УСПЕШНЫЙ ОТВЕТ * ========================================== */ return res
-      .status(201)
-      .json({
-        success: true,
-        returnId,
-        returnDocumentId: retailSalesReturn?.id || null,
-        /* * Общая сумма в копейках */ total: normalizedTotal,
-        /* * Наличные в копейках */ cashSum: localCashSum,
-        /* * Безналичные в копейках */ noCashSum: payment ? noCashSum : 0,
-        retailShiftSyncId,
-        retailShiftId: retailShift.id,
-        /* * Локальная операция * с кассой */ cashTransaction,
-        /* * Локальная запись * возврата */ returnRecord,
-        retailSalesReturn,
+      fs.mkdirSync(DATA_DIR, {
+        recursive: true,
       });
+    }
+
+    /* Читаем существующие возвраты */
+
+   let returns = readReturns();
+
+    /* ==========================================
+       СОЗДАЁМ ЛОКАЛЬНУЮ ЗАПИСЬ
+    ========================================== */
+
+    const returnRecord = {
+      id: returnId,
+
+      name: returnId,
+
+      date: new Date().toISOString(),
+
+      orderId: orderId || null,
+
+      demandId: demandId || null,
+
+      returnDocumentId: retailSalesReturn?.id || null,
+
+      retailShiftSyncId,
+
+      retailShiftId: retailShift.id,
+
+      storeId,
+
+      total: Number(total),
+
+      payment: {
+        cash,
+        card,
+      },
+
+      cashSum: localCashSum / 100,
+
+      noCashSum: payment ? noCashSum / 100 : 0,
+
+      items: items.map((item) => {
+        const quantity = Number(item.quantity);
+
+        const price = Number(item.price || 0);
+
+        return {
+          id: item.id,
+
+          name: item.name || "Без названия",
+
+          type: item.type || "product",
+
+          quantity,
+
+          price,
+
+          sum: price * quantity,
+        };
+      }),
+    };
+
+    /* ==========================================
+       ДОБАВЛЯЕМ НОВЫЙ ВОЗВРАТ
+    ========================================== */
+
+    returns.push(returnRecord);
+
+    /* ==========================================
+       СОРТИРОВКА ПО ДАТЕ
+    ========================================== */
+
+    returns.sort((a, b) => {
+      return new Date(b.date).getTime() - new Date(a.date).getTime();
+    });
+
+    /* ==========================================
+       СОХРАНЯЕМ returns.json
+    ========================================== */
+
+   writeReturns(returns);
+
+    console.log("Возврат сохранён в returns.json:", returnRecord);
+
+    /* ==========================================
+       УСПЕШНЫЙ ОТВЕТ
+    ========================================== */
+
+    return res.status(201).json({
+      success: true,
+      returnId,
+      returnDocumentId: retailSalesReturn?.id || null,
+      total: normalizedTotal,
+      cashSum: localCashSum,
+      noCashSum: payment ? noCashSum : 0,
+      retailShiftSyncId,
+      retailShiftId: retailShift.id,
+      cashTransaction,
+      returnRecord,
+      retailSalesReturn,
+    });
   } catch (error) {
     console.error("Ошибка создания розничного возврата:", error);
-    /* * Если ошибка пришла * от МойСклад, * показываем её подробно. */ const moySkladError =
-      error?.response?.data || error?.data;
+
+    const moySkladError = error?.response?.data || error?.data || null;
+
     console.error("Детали ошибки МойСклад:", moySkladError);
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: error.message || "Ошибка создания розничного возврата",
-        moySkladError: moySkladError || null,
-      });
+
+    return res.status(500).json({
+      success: false,
+
+      message: error.message || "Ошибка создания розничного возврата",
+
+      moySkladError: moySkladError || null,
+    });
   }
 });
-
-/*
- * ==========================================
- * ПРОДАВЦЫ
- * ==========================================
- *
- * Здесь вручную добавляешь продавцов.
- *
- * id должен быть уникальным.
- */
-
 
 app.get("/api/moysklad/salespersons", (req, res) => {
   try {
@@ -3069,6 +3174,31 @@ app.get("/api/moysklad/salespersons", (req, res) => {
       success: false,
       message: error.message || "Не удалось получить список продавцов",
       salespersons: [],
+    });
+  }
+});
+
+app.get("/api/moysklad/debug-auth", async (req, res) => {
+  try {
+    const token = await authorizeMoySklad();
+
+    const data = await moySkladRequest("/entity/store?limit=100");
+
+    return res.json({
+      success: true,
+      stores: (data.rows || []).map((store) => ({
+        id: store.id,
+        name: store.name,
+      })),
+      branch: getCurrentBranch(),
+      tokenExists: Boolean(token),
+    });
+  } catch (error) {
+    console.error("DEBUG AUTH ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message,
     });
   }
 });

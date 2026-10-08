@@ -4,6 +4,8 @@ const path = require("path");
 
 const router = express.Router();
 
+const { getCurrentBranch } = require("./branchContext");
+
 const DATA_DIR = path.join(__dirname, "..", "data");
 
 const multer = require("multer");
@@ -17,6 +19,69 @@ const upload = multer({
 
 /*
 |--------------------------------------------------------------------------
+| BRANCH HELPERS
+|--------------------------------------------------------------------------
+*/
+
+const BRANCHES = ["bishkek", "dordoy", "osh"];
+
+function getBranchKey() {
+  const branch = getCurrentBranch();
+
+  if (!branch?.id) {
+    throw new Error("Текущий филиал не определён");
+  }
+
+  const branchKey = String(branch.id).trim().toLowerCase();
+
+  if (!BRANCHES.includes(branchKey)) {
+    throw new Error(
+      `Неизвестный филиал: ${branchKey}. Ожидался: bishkek, dordoy или osh`,
+    );
+  }
+
+  return branchKey;
+}
+
+function getBranchArray(data, branchKey) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return [];
+  }
+
+  return Array.isArray(data[branchKey]) ? data[branchKey] : [];
+}
+
+function getBranchCash(data, branchKey) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return {
+      balance: 0,
+      transactions: [],
+    };
+  }
+
+  const branchCash = data[branchKey];
+
+  if (
+    !branchCash ||
+    typeof branchCash !== "object" ||
+    Array.isArray(branchCash)
+  ) {
+    return {
+      balance: 0,
+      transactions: [],
+    };
+  }
+
+  return {
+    balance: Number(branchCash.balance) || 0,
+    transactions: Array.isArray(branchCash.transactions)
+      ? branchCash.transactions
+      : [],
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
 | HELPERS
 |--------------------------------------------------------------------------
 */
@@ -26,12 +91,26 @@ async function readJson(fileName, fallback = null) {
     const filePath = path.join(DATA_DIR, fileName);
     const content = await fs.readFile(filePath, "utf8");
 
+    if (!content.trim()) {
+      return fallback;
+    }
+
     return JSON.parse(content);
   } catch (error) {
     console.error(`Ошибка чтения файла ${fileName}:`, error.message);
 
     return fallback;
   }
+}
+
+async function writeJson(fileName, data) {
+  const filePath = path.join(DATA_DIR, fileName);
+
+  await fs.mkdir(DATA_DIR, {
+    recursive: true,
+  });
+
+  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
 }
 
 function toNumber(value) {
@@ -163,11 +242,7 @@ function normalizeSalesData(sales) {
   return [];
 }
 
-function addPaymentToSummary(
-  salesByPayment,
-  item,
-  fallbackAmount = 0,
-) {
+function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
   const payment = getPaymentObject(item);
 
   /*
@@ -180,20 +255,11 @@ function addPaymentToSummary(
 
   const cardKopecks = getPaymentAmount(payment, ["card"]);
 
-  const amanatKopecks = getPaymentAmount(payment, [
-    "amanat",
-    "credit",
-  ]);
+  const amanatKopecks = getPaymentAmount(payment, ["amanat", "credit"]);
 
-  const mplusKopecks = getPaymentAmount(payment, [
-    "mplus",
-    "delivery",
-  ]);
+  const mplusKopecks = getPaymentAmount(payment, ["mplus", "delivery"]);
 
-  const localKopecks = getPaymentAmount(payment, [
-    "local",
-    "localPayment",
-  ]);
+  const localKopecks = getPaymentAmount(payment, ["local", "localPayment"]);
 
   const onlineQrKopecks = getPaymentAmount(payment, [
     "online_qr",
@@ -224,14 +290,7 @@ function addPaymentToSummary(
     salesByPayment.local += local;
     salesByPayment.online_qr += onlineQr;
 
-    return (
-      cash +
-      card +
-      amanat +
-      mplus +
-      local +
-      onlineQr
-    );
+    return cash + card + amanat + mplus + local + onlineQr;
   }
 
   const method =
@@ -339,6 +398,10 @@ function getReservationIdFromTransaction(transaction) {
 
 router.get("/", async (req, res) => {
   try {
+    const branchKey = getBranchKey();
+
+    const branch = getCurrentBranch();
+
     const { from = "", to = "" } = req.query;
 
     const range = normalizeDateRange(from, to);
@@ -349,22 +412,39 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const cash = await readJson("cash.json", {
-      balance: 0,
-      transactions: [],
-    });
+    const cashData = await readJson("cash.json", {});
 
-    const expenses = await readJson("expenses.json", []);
+    const expensesData = await readJson("expenses.json", {});
 
-    const sales = await readJson("sales.json", []);
+    const salesData = await readJson("sales.json", {});
 
-    const reservations = await readJson("reservations.json", []);
+    const reservationsData = await readJson("reservations.json", {});
 
-    const purchases = await readJson("purchases.json", []);
+    const purchasesData = await readJson("purchases.json", {});
 
-    const transfers = await readJson("transfers.json", []);
+    const transfersData = await readJson("transfers.json", {});
 
-    const returns = await readJson("returns.json", []);
+    const returnsData = await readJson("returns.json", {});
+
+    /*
+    |--------------------------------------------------------------------------
+    | БЕРЁМ ТОЛЬКО ТЕКУЩИЙ ФИЛИАЛ
+    |--------------------------------------------------------------------------
+    */
+
+    const cash = getBranchCash(cashData, branchKey);
+
+    const expenses = getBranchArray(expensesData, branchKey);
+
+    const sales = salesData?.[branchKey] || {};
+
+    const reservations = getBranchArray(reservationsData, branchKey);
+
+    const purchases = getBranchArray(purchasesData, branchKey);
+
+    const transfers = getBranchArray(transfersData, branchKey);
+
+    const returns = getBranchArray(returnsData, branchKey);
 
     const salesArray = normalizeSalesData(sales);
 
@@ -374,9 +454,7 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const reservationsArray = Array.isArray(reservations)
-      ? reservations
-      : [];
+    const reservationsArray = Array.isArray(reservations) ? reservations : [];
 
     /*
     |--------------------------------------------------------------------------
@@ -388,8 +466,7 @@ router.get("/", async (req, res) => {
       reservationsArray
         .filter(
           (reservation) =>
-            String(reservation.status || "").toLowerCase() ===
-            "cancelled",
+            String(reservation.status || "").toLowerCase() === "cancelled",
         )
         .filter((reservation) => reservation.id)
         .map((reservation) => String(reservation.id)),
@@ -403,8 +480,7 @@ router.get("/", async (req, res) => {
 
     const activeReservations = reservationsArray.filter(
       (reservation) =>
-        String(reservation.status || "").toLowerCase() !==
-        "cancelled",
+        String(reservation.status || "").toLowerCase() !== "cancelled",
     );
 
     /*
@@ -415,11 +491,7 @@ router.get("/", async (req, res) => {
 
     const cancelledOrderIds = new Set(
       salesArray
-        .filter(
-          (sale) =>
-            sale.cancelled === true &&
-            sale.orderId,
-        )
+        .filter((sale) => sale.cancelled === true && sale.orderId)
         .map((sale) => String(sale.orderId)),
     );
 
@@ -433,21 +505,13 @@ router.get("/", async (req, res) => {
       ? cash.transactions
       : [];
 
-    const filteredCashTransactions = cashTransactions.filter(
-      (transaction) => {
-        const date = getDate(
-          transaction.createdAt ||
-            transaction.date ||
-            transaction.updatedAt,
-        );
+    const filteredCashTransactions = cashTransactions.filter((transaction) => {
+      const date = getDate(
+        transaction.createdAt || transaction.date || transaction.updatedAt,
+      );
 
-        return isDateInRange(
-          date,
-          range.from,
-          range.to,
-        );
-      },
-    );
+      return isDateInRange(date, range.from, range.to);
+    });
 
     /*
     |--------------------------------------------------------------------------
@@ -479,52 +543,37 @@ router.get("/", async (req, res) => {
       const amount = toNumber(transaction.amount);
 
       /*
-      |--------------------------------------------------------------------------
-      | ОТМЕНЁННАЯ ПРОДАЖА
-      |--------------------------------------------------------------------------
-      */
+        |--------------------------------------------------------------------------
+        | ОТМЕНЁННАЯ ПРОДАЖА
+        |--------------------------------------------------------------------------
+        */
 
       if (
         type === "sale" &&
         transaction.orderId &&
-        cancelledOrderIds.has(
-          String(transaction.orderId),
-        )
+        cancelledOrderIds.has(String(transaction.orderId))
       ) {
         return;
       }
 
       /*
-      |--------------------------------------------------------------------------
-      | БРОНИРОВАНИЕ
-      |--------------------------------------------------------------------------
-      */
+        |--------------------------------------------------------------------------
+        | БРОНИРОВАНИЕ
+        |--------------------------------------------------------------------------
+        */
 
       if (type === "reservation") {
-        const reservationId =
-          getReservationIdFromTransaction(transaction);
+        const reservationId = getReservationIdFromTransaction(transaction);
 
         /*
-        | Если кассовая транзакция напрямую связана
-        | с отменённой бронью — НЕ считаем её приходом.
-        */
+          | Если кассовая транзакция напрямую связана
+          | с отменённой бронью — НЕ считаем её приходом.
+          */
+
         if (
           reservationId &&
-          cancelledReservationIds.has(
-            String(reservationId),
-          )
+          cancelledReservationIds.has(String(reservationId))
         ) {
-          /*
-          | Сохраняем отдельно для правильного netCashFlow.
-          |
-          | Например:
-          | deposit 500
-          | refund 500
-          |
-          | Приход = 0
-          | Возврат = 500
-          | Но реальный денежный поток = 0.
-          */
           if (amount > 0) {
             cancelledReservationDeposits += Math.abs(amount);
           }
@@ -532,12 +581,7 @@ router.get("/", async (req, res) => {
           return;
         }
 
-        /*
-        | Обычная действующая бронь
-        */
-        operationTypes[type] =
-          (operationTypes[type] || 0) +
-          Math.abs(amount);
+        operationTypes[type] = (operationTypes[type] || 0) + Math.abs(amount);
 
         cashReservations += Math.max(amount, 0);
 
@@ -545,14 +589,12 @@ router.get("/", async (req, res) => {
       }
 
       /*
-      |--------------------------------------------------------------------------
-      | ОСТАЛЬНЫЕ ОПЕРАЦИИ
-      |--------------------------------------------------------------------------
-      */
+        |--------------------------------------------------------------------------
+        | ОСТАЛЬНЫЕ ОПЕРАЦИИ
+        |--------------------------------------------------------------------------
+        */
 
-      operationTypes[type] =
-        (operationTypes[type] || 0) +
-        Math.abs(amount);
+      operationTypes[type] = (operationTypes[type] || 0) + Math.abs(amount);
 
       switch (type) {
         case "sale":
@@ -591,43 +633,28 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const expensesArray = Array.isArray(expenses)
-      ? expenses
-      : [];
+    const expensesArray = Array.isArray(expenses) ? expenses : [];
 
-    const filteredExpenses = expensesArray.filter(
-      (expense) => {
-        const date = getDate(
-          expense.createdAt ||
-            expense.date ||
-            expense.updatedAt,
-        );
+    const filteredExpenses = expensesArray.filter((expense) => {
+      const date = getDate(
+        expense.createdAt || expense.date || expense.updatedAt,
+      );
 
-        return isDateInRange(
-          date,
-          range.from,
-          range.to,
-        );
-      },
-    );
+      return isDateInRange(date, range.from, range.to);
+    });
 
     const expenseCategories = {};
 
     let totalExpenses = 0;
 
     filteredExpenses.forEach((expense) => {
-      const amount = Math.abs(
-        toNumber(expense.amount),
-      );
+      const amount = Math.abs(toNumber(expense.amount));
 
-      const category =
-        expense.category || "Без категории";
+      const category = expense.category || "Без категории";
 
       totalExpenses += amount;
 
-      expenseCategories[category] =
-        (expenseCategories[category] || 0) +
-        amount;
+      expenseCategories[category] = (expenseCategories[category] || 0) + amount;
     });
 
     /*
@@ -638,44 +665,34 @@ router.get("/", async (req, res) => {
 
     const filteredSales = salesArray.filter((sale) => {
       /*
-      | Отменённые продажи полностью исключаем.
-      */
+        | Отменённые продажи полностью исключаем.
+        */
+
       if (sale.cancelled === true) {
         return false;
       }
 
-      const date = getDate(
-        sale.createdAt ||
-          sale.date ||
-          sale.updatedAt,
-      );
+      const date = getDate(sale.createdAt || sale.date || sale.updatedAt);
 
-      return isDateInRange(
-        date,
-        range.from,
-        range.to,
-      );
+      return isDateInRange(date, range.from, range.to);
     });
 
-    const cashSaleTransactions =
-      filteredCashTransactions.filter(
-        (transaction) => {
-          if (transaction.type !== "sale") {
-            return false;
-          }
+    const cashSaleTransactions = filteredCashTransactions.filter(
+      (transaction) => {
+        if (transaction.type !== "sale") {
+          return false;
+        }
 
-          if (
-            transaction.orderId &&
-            cancelledOrderIds.has(
-              String(transaction.orderId),
-            )
-          ) {
-            return false;
-          }
+        if (
+          transaction.orderId &&
+          cancelledOrderIds.has(String(transaction.orderId))
+        ) {
+          return false;
+        }
 
-          return true;
-        },
-      );
+        return true;
+      },
+    );
 
     let salesTotal = 0;
 
@@ -701,21 +718,12 @@ router.get("/", async (req, res) => {
 
       filteredSales.forEach((sale) => {
         const total = Math.abs(
-          toNumber(
-            sale.totalSom ??
-              sale.total ??
-              sale.sum ??
-              sale.amount,
-          ),
+          toNumber(sale.totalSom ?? sale.total ?? sale.sum ?? sale.amount),
         );
 
         salesTotal += total;
 
-        addPaymentToSummary(
-          salesByPayment,
-          sale,
-          total,
-        );
+        addPaymentToSummary(salesByPayment, sale, total);
       });
     }
 
@@ -728,21 +736,13 @@ router.get("/", async (req, res) => {
     if (filteredSales.length === 0) {
       salesCount = cashSaleTransactions.length;
 
-      cashSaleTransactions.forEach(
-        (transaction) => {
-          const amount = Math.abs(
-            toNumber(transaction.amount),
-          );
+      cashSaleTransactions.forEach((transaction) => {
+        const amount = Math.abs(toNumber(transaction.amount));
 
-          salesTotal += amount;
+        salesTotal += amount;
 
-          addPaymentToSummary(
-            salesByPayment,
-            transaction,
-            amount,
-          );
-        },
-      );
+        addPaymentToSummary(salesByPayment, transaction, amount);
+      });
     }
 
     /*
@@ -771,19 +771,11 @@ router.get("/", async (req, res) => {
       salesByPayment.local = 0;
       salesByPayment.online_qr = 0;
 
-      cashSaleTransactions.forEach(
-        (transaction) => {
-          const amount = Math.abs(
-            toNumber(transaction.amount),
-          );
+      cashSaleTransactions.forEach((transaction) => {
+        const amount = Math.abs(toNumber(transaction.amount));
 
-          addPaymentToSummary(
-            salesByPayment,
-            transaction,
-            amount,
-          );
-        },
-      );
+        addPaymentToSummary(salesByPayment, transaction, amount);
+      });
     }
 
     /*
@@ -792,36 +784,23 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const filteredReservations =
-      activeReservations.filter(
-        (reservation) => {
-          const date = getDate(
-            reservation.createdAt ||
-              reservation.date ||
-              reservation.updatedAt,
-          );
-
-          return isDateInRange(
-            date,
-            range.from,
-            range.to,
-          );
-        },
+    const filteredReservations = activeReservations.filter((reservation) => {
+      const date = getDate(
+        reservation.createdAt || reservation.date || reservation.updatedAt,
       );
+
+      return isDateInRange(date, range.from, range.to);
+    });
 
     let reservationsTotal = 0;
 
-    filteredReservations.forEach(
-      (reservation) => {
-        reservationsTotal += Math.abs(
-          toNumber(
-            reservation.total ??
-              reservation.totalAmount ??
-              reservation.amount,
-          ),
-        );
-      },
-    );
+    filteredReservations.forEach((reservation) => {
+      reservationsTotal += Math.abs(
+        toNumber(
+          reservation.total ?? reservation.totalAmount ?? reservation.amount,
+        ),
+      );
+    });
 
     /*
     |--------------------------------------------------------------------------
@@ -829,38 +808,23 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const purchasesArray = Array.isArray(purchases)
-      ? purchases
-      : [];
+    const purchasesArray = Array.isArray(purchases) ? purchases : [];
 
-    const filteredPurchases =
-      purchasesArray.filter((purchase) => {
-        const date = getDate(
-          purchase.createdAt ||
-            purchase.date ||
-            purchase.updatedAt,
-        );
+    const filteredPurchases = purchasesArray.filter((purchase) => {
+      const date = getDate(
+        purchase.createdAt || purchase.date || purchase.updatedAt,
+      );
 
-        return isDateInRange(
-          date,
-          range.from,
-          range.to,
-        );
-      });
+      return isDateInRange(date, range.from, range.to);
+    });
 
     let purchasesTotal = 0;
 
-    filteredPurchases.forEach(
-      (purchase) => {
-        purchasesTotal += Math.abs(
-          toNumber(
-            purchase.total ??
-              purchase.sum ??
-              purchase.amount,
-          ),
-        );
-      },
-    );
+    filteredPurchases.forEach((purchase) => {
+      purchasesTotal += Math.abs(
+        toNumber(purchase.total ?? purchase.sum ?? purchase.amount),
+      );
+    });
 
     /*
     |--------------------------------------------------------------------------
@@ -868,36 +832,18 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const returnsArray = Array.isArray(returns)
-      ? returns
-      : [];
+    const returnsArray = Array.isArray(returns) ? returns : [];
 
-    const filteredReturns = returnsArray.filter(
-      (item) => {
-        const date = getDate(
-          item.createdAt ||
-            item.date ||
-            item.updatedAt,
-        );
+    const filteredReturns = returnsArray.filter((item) => {
+      const date = getDate(item.createdAt || item.date || item.updatedAt);
 
-        return isDateInRange(
-          date,
-          range.from,
-          range.to,
-        );
-      },
-    );
+      return isDateInRange(date, range.from, range.to);
+    });
 
     let returnsTotal = 0;
 
     filteredReturns.forEach((item) => {
-      returnsTotal += Math.abs(
-        toNumber(
-          item.total ??
-            item.amount ??
-            item.sum,
-        ),
-      );
+      returnsTotal += Math.abs(toNumber(item.total ?? item.amount ?? item.sum));
     });
 
     /*
@@ -908,154 +854,135 @@ router.get("/", async (req, res) => {
 
     const dailyMap = {};
 
-    filteredCashTransactions.forEach(
-      (transaction) => {
-        /*
+    filteredCashTransactions.forEach((transaction) => {
+      /*
         | Отменённая продажа
         */
-        if (
-          transaction.type === "sale" &&
-          transaction.orderId &&
-          cancelledOrderIds.has(
-            String(transaction.orderId),
-          )
-        ) {
-          return;
-        }
 
-        const date = getDate(
-          transaction.createdAt ||
-            transaction.date ||
-            transaction.updatedAt,
-        );
+      if (
+        transaction.type === "sale" &&
+        transaction.orderId &&
+        cancelledOrderIds.has(String(transaction.orderId))
+      ) {
+        return;
+      }
 
-        const day = getDayKey(date);
+      const date = getDate(
+        transaction.createdAt || transaction.date || transaction.updatedAt,
+      );
 
-        if (!day) {
-          return;
-        }
+      const day = getDayKey(date);
 
-        if (!dailyMap[day]) {
-          dailyMap[day] = emptyDay();
-        }
+      if (!day) {
+        return;
+      }
 
-        const amount = Math.abs(
-          toNumber(transaction.amount),
-        );
+      if (!dailyMap[day]) {
+        dailyMap[day] = emptyDay();
+      }
 
-        /*
+      const amount = Math.abs(toNumber(transaction.amount));
+
+      /*
         |--------------------------------------------------------------------------
         | Отменённая бронь
         |--------------------------------------------------------------------------
         */
 
-        if (transaction.type === "reservation") {
-          const reservationId =
-            getReservationIdFromTransaction(
-              transaction,
-            );
+      if (transaction.type === "reservation") {
+        const reservationId = getReservationIdFromTransaction(transaction);
 
-          if (
-            reservationId &&
-            cancelledReservationIds.has(
-              String(reservationId),
-            )
-          ) {
-            /*
+        if (
+          reservationId &&
+          cancelledReservationIds.has(String(reservationId))
+        ) {
+          /*
             | Не показываем отменённую бронь
             | в приходе за день.
             |
             | Но для net добавляем её обратно,
             | потому что ниже refund будет вычтен.
             */
-            dailyMap[day].net += amount;
 
-            return;
-          }
+          dailyMap[day].net += amount;
 
-          dailyMap[day].reservations += amount;
+          return;
         }
 
-        /*
+        dailyMap[day].reservations += amount;
+      }
+
+      /*
         |--------------------------------------------------------------------------
         | Остальные операции
         |--------------------------------------------------------------------------
         */
 
-        switch (transaction.type) {
-          case "sale":
-            dailyMap[day].sales += amount;
-            break;
+      switch (transaction.type) {
+        case "sale":
+          dailyMap[day].sales += amount;
+          break;
 
-          case "Rashod":
-          case "expense":
-            dailyMap[day].expenses += amount;
-            break;
+        case "Rashod":
+        case "expense":
+          dailyMap[day].expenses += amount;
+          break;
 
-          case "return":
-            dailyMap[day].returns += amount;
-            break;
+        case "return":
+          dailyMap[day].returns += amount;
+          break;
 
-          case "buyFromPostavshik":
-            dailyMap[day].supplierPayments += amount;
-            break;
+        case "buyFromPostavshik":
+          dailyMap[day].supplierPayments += amount;
+          break;
 
-          case "deposit":
-            dailyMap[day].deposits += amount;
-            break;
+        case "deposit":
+          dailyMap[day].deposits += amount;
+          break;
 
-          case "withdraw":
-            dailyMap[day].withdraws += amount;
-            break;
+        case "withdraw":
+          dailyMap[day].withdraws += amount;
+          break;
 
-          default:
-            break;
-        }
+        default:
+          break;
+      }
 
-        /*
+      /*
         |--------------------------------------------------------------------------
         | NET
         |--------------------------------------------------------------------------
         */
 
-        dailyMap[day].net =
-          dailyMap[day].sales +
-          dailyMap[day].reservations +
-          dailyMap[day].deposits -
-          dailyMap[day].expenses -
-          dailyMap[day].returns -
-          dailyMap[day].supplierPayments -
-          dailyMap[day].withdraws;
+      dailyMap[day].net =
+        dailyMap[day].sales +
+        dailyMap[day].reservations +
+        dailyMap[day].deposits -
+        dailyMap[day].expenses -
+        dailyMap[day].returns -
+        dailyMap[day].supplierPayments -
+        dailyMap[day].withdraws;
 
-        /*
+      /*
         | Важно:
         | если была отменённая бронь,
         | её депозит добавляется отдельно в net.
         */
-        if (
-          transaction.type === "reservation"
-        ) {
-          const reservationId =
-            getReservationIdFromTransaction(
-              transaction,
-            );
 
-          if (
-            reservationId &&
-            cancelledReservationIds.has(
-              String(reservationId),
-            )
-          ) {
-            dailyMap[day].net += amount;
-          }
+      if (transaction.type === "reservation") {
+        const reservationId = getReservationIdFromTransaction(transaction);
+
+        if (
+          reservationId &&
+          cancelledReservationIds.has(String(reservationId))
+        ) {
+          dailyMap[day].net += amount;
         }
-      },
-    );
+      }
+    });
 
     const daily = Object.entries(dailyMap)
-      .sort(([a], [b]) =>
-        a.localeCompare(b),
-      )
+      .sort(([a], [b]) => a.localeCompare(b))
       .map(([date, values]) => ({
         date,
         ...values,
@@ -1076,14 +1003,10 @@ router.get("/", async (req, res) => {
     |
     | Отменённые брони сюда НЕ входят.
     */
-    const income =
-      cashSales +
-      cashReservations;
 
-    const outgoing =
-      cashExpenses +
-      cashReturns +
-      supplierPayments;
+    const income = cashSales + cashReservations;
+
+    const outgoing = cashExpenses + cashReturns + supplierPayments;
 
     /*
     | Для netCashFlow учитываем реальные деньги.
@@ -1094,10 +1017,8 @@ router.get("/", async (req, res) => {
     |
     | итог = 0.
     */
-    const netCashFlow =
-      income +
-      cancelledReservationDeposits -
-      outgoing;
+
+    const netCashFlow = income + cancelledReservationDeposits - outgoing;
 
     /*
     |--------------------------------------------------------------------------
@@ -1105,42 +1026,30 @@ router.get("/", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const transactions =
-      filteredCashTransactions
-        .map((transaction) => ({
-          id: transaction.id,
+    const transactions = filteredCashTransactions
+      .map((transaction) => ({
+        id: transaction.id,
 
-          type: transaction.type,
+        type: transaction.type,
 
-          amount: toNumber(
-            transaction.amount,
-          ),
+        amount: toNumber(transaction.amount),
 
-          responsible:
-            transaction.responsible || "",
+        responsible: transaction.responsible || "",
 
-          comment:
-            transaction.comment || "",
+        comment: transaction.comment || "",
 
-          category:
-            transaction.category || "",
+        category: transaction.category || "",
 
-          reservationId:
-            transaction.reservationId ||
-            transaction.bookingId ||
-            transaction.reservation?.id ||
-            "",
+        reservationId:
+          transaction.reservationId ||
+          transaction.bookingId ||
+          transaction.reservation?.id ||
+          "",
 
-          createdAt:
-            transaction.createdAt ||
-            transaction.date ||
-            transaction.updatedAt,
-        }))
-        .sort(
-          (a, b) =>
-            new Date(b.createdAt) -
-            new Date(a.createdAt),
-        );
+        createdAt:
+          transaction.createdAt || transaction.date || transaction.updatedAt,
+      }))
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     /*
     |--------------------------------------------------------------------------
@@ -1149,16 +1058,19 @@ router.get("/", async (req, res) => {
     */
 
     console.log("REPORT SALES:", {
+      branch: {
+        id: branchKey,
+        name: branch?.storeName || branch?.name || "",
+      },
+
       period: {
         from,
         to,
       },
 
-      salesFromSalesJson:
-        filteredSales.length,
+      salesFromSalesJson: filteredSales.length,
 
-      salesFromCashJson:
-        cashSaleTransactions.length,
+      salesFromCashJson: cashSaleTransactions.length,
 
       salesTotal,
 
@@ -1168,16 +1080,18 @@ router.get("/", async (req, res) => {
 
       reservationsTotal,
 
-      activeReservations:
-        filteredReservations.length,
+      activeReservations: filteredReservations.length,
 
       cancelledReservations:
-        reservationsArray.length -
-        activeReservations.length,
+        reservationsArray.length - activeReservations.length,
 
       cashReservations,
 
       cancelledReservationDeposits,
+
+      purchasesTotal,
+
+      purchasesCount: filteredPurchases.length,
 
       income,
 
@@ -1193,6 +1107,11 @@ router.get("/", async (req, res) => {
     res.json({
       success: true,
 
+      branch: {
+        id: branchKey,
+        name: branch?.storeName || branch?.name || "",
+      },
+
       period: {
         from: from || null,
         to: to || null,
@@ -1205,6 +1124,7 @@ router.get("/", async (req, res) => {
         | Только продажи + действующие брони.
         | Отменённые брони здесь НЕ учитываются.
         */
+
         income,
 
         expenses: totalExpenses,
@@ -1226,45 +1146,37 @@ router.get("/", async (req, res) => {
         /*
         | Только действующие брони.
         */
+
         reservations: reservationsTotal,
 
-        reservationsCount:
-          filteredReservations.length,
+        reservationsCount: filteredReservations.length,
 
         purchases: purchasesTotal,
 
-        purchasesCount:
-          filteredPurchases.length,
+        purchasesCount: filteredPurchases.length,
 
         returnsTotal,
 
-        returnsCount:
-          filteredReturns.length,
+        returnsCount: filteredReturns.length,
 
         netCashFlow,
       },
 
       salesByPayment,
 
-      expensesByCategory:
-        Object.entries(expenseCategories)
-          .map(([name, value]) => ({
-            name,
-            value,
-          }))
-          .sort(
-            (a, b) => b.value - a.value,
-          ),
+      expensesByCategory: Object.entries(expenseCategories)
+        .map(([name, value]) => ({
+          name,
+          value,
+        }))
+        .sort((a, b) => b.value - a.value),
 
-      operationTypes:
-        Object.entries(operationTypes)
-          .map(([name, value]) => ({
-            name,
-            value,
-          }))
-          .sort(
-            (a, b) => b.value - a.value,
-          ),
+      operationTypes: Object.entries(operationTypes)
+        .map(([name, value]) => ({
+          name,
+          value,
+        }))
+        .sort((a, b) => b.value - a.value),
 
       daily,
 
@@ -1277,30 +1189,22 @@ router.get("/", async (req, res) => {
 
         sales: salesArray.length,
 
-        reservations:
-          reservationsArray.length,
+        reservations: reservationsArray.length,
 
-        purchases:
-          purchasesArray.length,
+        purchases: purchasesArray.length,
 
-        transfers: Array.isArray(transfers)
-          ? transfers.length
-          : 0,
+        transfers: transfers.length,
 
         returns: returnsArray.length,
       },
     });
   } catch (error) {
-    console.error(
-      "REPORT ERROR:",
-      error,
-    );
+    console.error("REPORT ERROR:", error);
 
     res.status(500).json({
       success: false,
 
-      message:
-        "Не удалось сформировать отчёт",
+      message: "Не удалось сформировать отчёт",
 
       error: error.message,
     });
@@ -1315,218 +1219,210 @@ router.get("/", async (req, res) => {
 |--------------------------------------------------------------------------
 */
 
-router.post(
-  "/send-telegram",
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      const botToken =
-        process.env.TELEGRAM_BOT_TOKEN;
+router.post("/send-telegram", upload.single("file"), async (req, res) => {
+  try {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    const branch = getCurrentBranch();
+   const branchKey = String(branch.id).toLowerCase();
 
-      const chatId =
-        process.env.TELEGRAM_CHAT_ID;
+   
+    const telegramChatIds = {
+  bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
+  dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
+  osh: process.env.TELEGRAM_CHAT_ID_OSH,
+};
 
-      if (!botToken) {
-        return res.status(500).json({
-          success: false,
+const chatId = telegramChatIds[branchKey];
 
-          message:
-            "TELEGRAM_BOT_TOKEN не настроен",
-        });
-      }
-
-      if (!chatId) {
-        return res.status(500).json({
-          success: false,
-
-          message:
-            "TELEGRAM_CHAT_ID не настроен",
-        });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-
-          message:
-            "PDF-файл не передан",
-        });
-      }
-
-      const caption =
-        req.body?.caption ||
-        `Отчёт кассы\n${new Date().toLocaleString(
-          "ru-RU",
-        )}`;
-
-      const formData = new FormData();
-
-      formData.append(
-        "chat_id",
-        chatId,
-      );
-
-      formData.append(
-        "caption",
-        caption,
-      );
-
-      const blob = new Blob(
-        [req.file.buffer],
-        {
-          type:
-            req.file.mimetype ||
-            "application/pdf",
-        },
-      );
-
-      formData.append(
-        "document",
-        blob,
-        req.file.originalname ||
-          "report.pdf",
-      );
-
-      const telegramResponse =
-        await fetch(
-          `https://api.telegram.org/bot${botToken}/sendDocument`,
-          {
-            method: "POST",
-            body: formData,
-          },
-        );
-
-      const telegramData =
-        await telegramResponse.json();
-
-      if (
-        !telegramResponse.ok ||
-        !telegramData.ok
-      ) {
-        console.error(
-          "TELEGRAM ERROR:",
-          telegramData,
-        );
-
-        return res.status(500).json({
-          success: false,
-
-          message:
-            telegramData.description ||
-            "Telegram не принял файл",
-        });
-      }
-
-      res.json({
-        success: true,
-
-        message:
-          "Отчёт отправлен в Telegram",
-      });
-    } catch (error) {
-      console.error(
-        "SEND TELEGRAM REPORT ERROR:",
-        error,
-      );
-
-      res.status(500).json({
+    if (!botToken) {
+      return res.status(500).json({
         success: false,
 
-        message:
-          "Не удалось отправить отчёт в Telegram",
-
-        error: error.message,
+        message: "TELEGRAM_BOT_TOKEN не настроен",
       });
     }
-  },
-);
+
+    if (!chatId) {
+      return res.status(500).json({
+        success: false,
+
+        message: "TELEGRAM_CHAT_ID не настроен",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+
+        message: "PDF-файл не передан",
+      });
+    }
+
+    const caption =
+      req.body?.caption || `Отчёт кассы\n${new Date().toLocaleString("ru-RU")}`;
+
+    const formData = new FormData();
+
+    formData.append("chat_id", chatId);
+
+    formData.append("caption", caption);
+
+    const blob = new Blob([req.file.buffer], {
+      type: req.file.mimetype || "application/pdf",
+    });
+
+    formData.append("document", blob, req.file.originalname || "report.pdf");
+
+    const telegramResponse = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendDocument`,
+      {
+        method: "POST",
+        body: formData,
+      },
+    );
+
+    const telegramData = await telegramResponse.json();
+
+    if (!telegramResponse.ok || !telegramData.ok) {
+      console.error("TELEGRAM ERROR:", telegramData);
+
+      return res.status(500).json({
+        success: false,
+
+        message: telegramData.description || "Telegram не принял файл",
+      });
+    }
+
+    res.json({
+      success: true,
+
+      message: "Отчёт отправлен в Telegram",
+    });
+  } catch (error) {
+    console.error("SEND TELEGRAM REPORT ERROR:", error);
+
+    res.status(500).json({
+      success: false,
+
+      message: "Не удалось отправить отчёт в Telegram",
+
+      error: error.message,
+    });
+  }
+});
 
 /*
 |--------------------------------------------------------------------------
-| ROUTE: CLEAR ALL DATA
+| ROUTE: CLEAR CURRENT BRANCH DATA
 |--------------------------------------------------------------------------
 | DELETE /api/reports/clear
 |--------------------------------------------------------------------------
 */
 
-router.delete(
-  "/clear",
-  async (req, res) => {
-    try {
-      const files = [
-        "cash.json",
-        "expenses.json",
-        "sales.json",
-        "reservations.json",
-        "purchases.json",
-        "transfers.json",
-        "returns.json",
-      ];
+router.delete("/clear", async (req, res) => {
+  try {
+    const branchKey = getBranchKey();
 
-      const emptyData = {
-        "cash.json": {
-          balance: 0,
-          transactions: [],
-        },
+    const files = [
+      "cash.json",
+      "expenses.json",
+      "sales.json",
+      "reservations.json",
+      "purchases.json",
+      "transfers.json",
+      "returns.json",
+    ];
 
-        "expenses.json": [],
+    /*
+      |--------------------------------------------------------------------------
+      | CASH
+      |--------------------------------------------------------------------------
+      */
 
-        "sales.json": [],
+    const cashData = await readJson("cash.json", {});
 
-        "reservations.json": [],
+    const newCashData =
+      cashData && typeof cashData === "object" && !Array.isArray(cashData)
+        ? {
+            ...cashData,
+          }
+        : {};
 
-        "purchases.json": [],
+    newCashData.bishkek = newCashData.bishkek || {
+      balance: 0,
+      transactions: [],
+    };
 
-        "transfers.json": [],
+    newCashData.dordoy = newCashData.dordoy || {
+      balance: 0,
+      transactions: [],
+    };
 
-        "returns.json": [],
-      };
+    newCashData.osh = newCashData.osh || {
+      balance: 0,
+      transactions: [],
+    };
 
-      for (const fileName of files) {
-        const filePath = path.join(
-          DATA_DIR,
-          fileName,
-        );
+    newCashData[branchKey] = {
+      balance: 0,
+      transactions: [],
+    };
 
-        await fs.writeFile(
-          filePath,
-          JSON.stringify(
-            emptyData[fileName],
-            null,
-            2,
-          ),
-          "utf8",
-        );
-      }
+    await writeJson("cash.json", newCashData);
 
-      console.log(
-        "ВСЕ JSON-ДАННЫЕ ОЧИЩЕНЫ",
-      );
+    /*
+      |--------------------------------------------------------------------------
+      | ОСТАЛЬНЫЕ JSON
+      |--------------------------------------------------------------------------
+      */
 
-      res.json({
-        success: true,
+    for (const fileName of files.filter(
+      (fileName) => fileName !== "cash.json",
+    )) {
+      const currentData = await readJson(fileName, {});
 
-        message:
-          "Все данные успешно очищены",
+      const newData =
+        currentData &&
+        typeof currentData === "object" &&
+        !Array.isArray(currentData)
+          ? {
+              ...currentData,
+            }
+          : {};
 
-        files,
-      });
-    } catch (error) {
-      console.error(
-        "CLEAR DATA ERROR:",
-        error,
-      );
+      newData.bishkek = Array.isArray(newData.bishkek) ? newData.bishkek : [];
 
-      res.status(500).json({
-        success: false,
+      newData.dordoy = Array.isArray(newData.dordoy) ? newData.dordoy : [];
 
-        message:
-          "Не удалось очистить данные",
+      newData.osh = Array.isArray(newData.osh) ? newData.osh : [];
 
-        error: error.message,
-      });
+      newData[branchKey] = [];
+
+      await writeJson(fileName, newData);
     }
-  },
-);
+
+    console.log(`ДАННЫЕ ОЧИЩЕНЫ ТОЛЬКО ДЛЯ ФИЛИАЛА: ${branchKey}`);
+
+    res.json({
+      success: true,
+
+      message: `Данные филиала ${branchKey} успешно очищены`,
+
+      branch: branchKey,
+
+      files,
+    });
+  } catch (error) {
+    console.error("CLEAR DATA ERROR:", error);
+
+    res.status(500).json({
+      success: false,
+
+      message: "Не удалось очистить данные",
+
+      error: error.message,
+    });
+  }
+});
 
 module.exports = router;
