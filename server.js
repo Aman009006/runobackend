@@ -45,6 +45,8 @@ const personnelRouter = require("./personnel");
 
 const expensesRouter = require("./expenses");
 const amanatRoutes = require("./amanat");
+const budgetRouter = require("./budget"); // скорректируйте путь под расположение файла
+app.use("/api/budget", budgetRouter);
 
 app.use("/api/expenses", expensesRouter);
 app.use("/api/moysklad", writeoffRouter);
@@ -88,6 +90,296 @@ const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
 // Создаем папку data
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+const budgetFs = require("fs/promises");
+const budgetPath = require("path");
+
+const CASHBOX_BUDGET_FILE = budgetPath.join(DATA_DIR, "budget.json");
+
+async function readCashboxBudget() {
+  let database;
+
+  try {
+    const content = await budgetFs.readFile(CASHBOX_BUDGET_FILE, "utf8");
+
+    database = content.trim() ? JSON.parse(content) : {};
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      database = {};
+    } else {
+      throw error;
+    }
+  }
+
+  if (!database || typeof database !== "object" || Array.isArray(database)) {
+    throw new Error("Некорректный формат budget.json");
+  }
+
+  let people = Array.isArray(database.people) ? database.people : [];
+
+  if (!people.length && Array.isArray(database.entries)) {
+    people = database.entries.map((entry) => ({
+      ...entry,
+      status:
+        entry.status || (entry.type === "received" ? "received" : "waiting"),
+      receivedAt:
+        entry.receivedAt ||
+        (entry.type === "received" ? entry.createdAt : null),
+    }));
+  }
+
+  return {
+    ...database,
+    topups: Array.isArray(database.topups) ? database.topups : [],
+    people,
+    transactions: Array.isArray(database.transactions)
+      ? database.transactions
+      : [],
+    totals: database.totals || {},
+  };
+}
+
+async function writeCashboxBudget(database) {
+  await budgetFs.mkdir(budgetPath.dirname(CASHBOX_BUDGET_FILE), {
+    recursive: true,
+  });
+
+  const tempFile = `${CASHBOX_BUDGET_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+
+  await budgetFs.writeFile(tempFile, JSON.stringify(database, null, 2), "utf8");
+
+  await budgetFs.rename(tempFile, CASHBOX_BUDGET_FILE);
+}
+
+function getCashboxBalance(database) {
+  const topups = database.topups.reduce(
+    (sum, item) => sum + Number(item.amount || 0),
+    0,
+  );
+
+  const issued = database.people
+    .filter((person) => person.status === "received")
+    .reduce((sum, person) => sum + Number(person.amount || 0), 0);
+
+  return Math.round((topups - issued) * 100) / 100;
+}
+
+async function getCashboxPersonForSale(entryId, payment, total) {
+  const cashboxAmount = Number(payment.cashbox || 0);
+  const method = payment.method;
+
+  if (cashboxAmount === 0) {
+    if (entryId) {
+      throw new Error(
+        "Выбран человек из бюджета, но сумма оплаты из бюджета равна нулю",
+      );
+    }
+
+    if (method === "cashbox") {
+      throw new Error("Укажите человека для оплаты через бюджет");
+    }
+
+    return null;
+  }
+
+  if (!entryId) {
+    throw new Error("Не выбран человек для оплаты через бюджет");
+  }
+
+  if (method !== "cashbox" && method !== "all") {
+    throw new Error("Некорректный способ оплаты через бюджет");
+  }
+
+  if (method === "cashbox" && cashboxAmount !== total) {
+    throw new Error(
+      "При оплате только через бюджет сумма должна совпадать с суммой заказа",
+    );
+  }
+
+  if (method === "all" && cashboxAmount >= total) {
+    throw new Error(
+      "При смешанной оплате остаток нужно оплатить другим способом",
+    );
+  }
+
+  const database = await readCashboxBudget();
+
+  const person = database.people.find(
+    (item) => String(item.id) === String(entryId),
+  );
+
+  if (!person) {
+    throw new Error("Запись бюджета не найдена");
+  }
+
+  if (person.status !== "waiting") {
+    throw new Error("Этот человек уже получил деньги или недоступен");
+  }
+
+  const expectedAmount = Math.round(Number(person.amount) * 100);
+
+  if (
+    !Number.isSafeInteger(expectedAmount) ||
+    expectedAmount <= 0 ||
+    expectedAmount !== cashboxAmount
+  ) {
+    throw new Error(
+      "Сумма оплаты из бюджета не совпадает с суммой выбранного человека",
+    );
+  }
+
+  if (Number(person.amount) > getCashboxBalance(database)) {
+    throw new Error("Недостаточно средств в общем бюджете");
+  }
+
+  return {
+    id: person.id,
+    name: person.name,
+    amount: Number(person.amount),
+  };
+}
+
+async function markCashboxPersonReceived(entryId, saleId) {
+  if (!entryId) return null;
+
+  const database = await readCashboxBudget();
+
+  const person = database.people.find(
+    (item) => String(item.id) === String(entryId),
+  );
+
+  if (!person) {
+    throw new Error(
+      `Запись бюджета ${entryId} не найдена`,
+    );
+  }
+
+  // Защита от повторного списания
+  if (person.status === "received") {
+    if (String(person.cashboxSaleId || "") === String(saleId)) {
+      return person;
+    }
+
+    throw new Error("Этот человек уже отмечен как получивший деньги");
+  }
+
+  const amount = Number(person.amount);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Некорректная сумма человека в бюджете");
+  }
+
+  const availableBalance = getCashboxBalance(database);
+
+  if (amount > availableBalance) {
+    throw new Error(
+      `Недостаточно средств: доступно ${availableBalance}, требуется ${amount}`,
+    );
+  }
+
+  person.status = "received";
+  person.receivedAt = new Date().toISOString();
+  person.cashboxSaleId = saleId;
+
+  // Пересчитываем сохранённые totals
+  const topups = database.topups.reduce(
+    (sum, item) => sum + Number(item.amount || 0),
+    0,
+  );
+
+  const spent = database.people
+    .filter((item) => item.status === "received")
+    .reduce(
+      (sum, item) => sum + Number(item.amount || 0),
+      0,
+    );
+
+  const roundMoney = (value) =>
+    Math.round((value + Number.EPSILON) * 100) / 100;
+
+  database.totals = {
+    topups: roundMoney(topups),
+    spent: roundMoney(spent),
+    issued: roundMoney(spent),
+    balance: roundMoney(topups - spent),
+    updatedAt: new Date().toISOString(),
+  };
+
+  // Обновляем историю выдач
+  const topupTransactions = database.topups.map((item) => ({
+    id: item.id,
+    type: "topup",
+    label: "Пополнение бюджета",
+    amount: Number(item.amount || 0),
+    comment: item.comment || "",
+    createdAt: item.createdAt,
+  }));
+
+  const issuedTransactions = database.people
+    .filter((item) => item.status === "received")
+    .map((item) => ({
+      id: `issued-${item.id}`,
+      personId: item.id,
+      type: "issued",
+      label: "Выдача человеку",
+      name: item.name,
+      phone: item.phone || "",
+      amount: Number(item.amount || 0),
+      comment: item.comment || "",
+      createdAt: item.receivedAt || item.createdAt,
+    }));
+
+  database.transactions = [
+    ...topupTransactions,
+    ...issuedTransactions,
+  ].sort(
+    (a, b) =>
+      new Date(b.createdAt || 0) -
+      new Date(a.createdAt || 0),
+  );
+
+  await writeCashboxBudget(database);
+
+  console.log("Бюджет обновлён после продажи:", {
+    person: person.name,
+    amount,
+    saleId,
+    totals: database.totals,
+  });
+
+  return person;
+}
+
+async function restoreCashboxPersonAfterCancellation(sale) {
+  const entryId = sale.cashboxEntryId;
+
+  if (!entryId) return false;
+
+  const database = await readCashboxBudget();
+
+  const person = database.people.find(
+    (item) => String(item.id) === String(entryId),
+  );
+
+  if (!person) {
+    throw new Error("Продажа отменена, но связанная запись бюджета не найдена");
+  }
+
+  // Не отменяем чужое или более позднее списание.
+  if (String(person.cashboxSaleId || "") !== String(sale.id)) {
+    throw new Error(
+      "Запись бюджета не связана с этой продажей. Статус автоматически не изменён",
+    );
+  }
+
+  person.status = "waiting";
+  person.receivedAt = null;
+  delete person.cashboxSaleId;
+
+  await writeCashboxBudget(database);
+
+  return true;
 }
 
 // =========================================================
@@ -172,11 +464,7 @@ function writeBranchData(filePath, value, defaultValue) {
 
   allData[branchKey] = value;
 
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify(allData, null, 2),
-    "utf8",
-  );
+  fs.writeFileSync(filePath, JSON.stringify(allData, null, 2), "utf8");
 
   return value;
 }
@@ -193,10 +481,7 @@ function getDefaultCashData() {
 
 function readSales() {
   try {
-    return readBranchData(
-      SALES_FILE,
-      {},
-    );
+    return readBranchData(SALES_FILE, {});
   } catch (error) {
     console.error("Ошибка чтения продаж текущего филиала:", error);
 
@@ -206,15 +491,9 @@ function readSales() {
 
 function readSalespersons() {
   try {
-    return readBranchData(
-      SALESPERSONS_FILE,
-      [],
-    );
+    return readBranchData(SALESPERSONS_FILE, []);
   } catch (error) {
-    console.error(
-      "Ошибка чтения продавцов текущего филиала:",
-      error,
-    );
+    console.error("Ошибка чтения продавцов текущего филиала:", error);
 
     return [];
   }
@@ -222,11 +501,7 @@ function readSalespersons() {
 
 function writeSales(sales) {
   try {
-    writeBranchData(
-      SALES_FILE,
-      sales,
-      {},
-    );
+    writeBranchData(SALES_FILE, sales, {});
   } catch (error) {
     console.error("Ошибка записи продаж текущего филиала:", error);
 
@@ -234,25 +509,24 @@ function writeSales(sales) {
   }
 }
 
-
 async function sendTelegramCancellationNotification(sale) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-   const branch = getCurrentBranch();
-   const branchKey = String(branch.id).toLowerCase();
+  const branch = getCurrentBranch();
+  const branchKey = String(branch.id).toLowerCase();
 
-    // Новый формат:
-    // {
-    //   bishkek: {...},
-    //   dordoy: {...},
-    //   osh: {...}
-    // }
-    const telegramChatIds = {
-  bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
-  dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
-  osh: process.env.TELEGRAM_CHAT_ID_OSH,
-};
+  // Новый формат:
+  // {
+  //   bishkek: {...},
+  //   dordoy: {...},
+  //   osh: {...}
+  // }
+  const telegramChatIds = {
+    bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
+    dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
+    osh: process.env.TELEGRAM_CHAT_ID_OSH,
+  };
 
-const chatId = telegramChatIds[branchKey];
+  const chatId = telegramChatIds[branchKey];
   // const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!botToken || !chatId) {
@@ -385,11 +659,9 @@ function readCash() {
       allCash &&
       typeof allCash === "object" &&
       !Array.isArray(allCash) &&
-      (
-        Object.prototype.hasOwnProperty.call(allCash, "bishkek") ||
+      (Object.prototype.hasOwnProperty.call(allCash, "bishkek") ||
         Object.prototype.hasOwnProperty.call(allCash, "dordoy") ||
-        Object.prototype.hasOwnProperty.call(allCash, "osh")
-      )
+        Object.prototype.hasOwnProperty.call(allCash, "osh"))
     ) {
       if (!allCash[branchKey]) {
         allCash[branchKey] = {
@@ -397,11 +669,7 @@ function readCash() {
           transactions: [],
         };
 
-        fs.writeFileSync(
-          CASH_FILE,
-          JSON.stringify(allCash, null, 2),
-          "utf8"
-        );
+        fs.writeFileSync(CASH_FILE, JSON.stringify(allCash, null, 2), "utf8");
       }
 
       return allCash[branchKey];
@@ -432,10 +700,8 @@ function readCash() {
       allCash &&
       typeof allCash === "object" &&
       !Array.isArray(allCash) &&
-      (
-        typeof allCash.balance === "number" ||
-        Array.isArray(allCash.transactions)
-      )
+      (typeof allCash.balance === "number" ||
+        Array.isArray(allCash.transactions))
     ) {
       migrated[branchKey] = {
         balance: Number(allCash.balance) || 0,
@@ -445,11 +711,7 @@ function readCash() {
       };
     }
 
-    fs.writeFileSync(
-      CASH_FILE,
-      JSON.stringify(migrated, null, 2),
-      "utf8"
-    );
+    fs.writeFileSync(CASH_FILE, JSON.stringify(migrated, null, 2), "utf8");
 
     return migrated[branchKey];
   } catch (error) {
@@ -461,7 +723,6 @@ function readCash() {
     };
   }
 }
-
 
 function writeCash(cash) {
   try {
@@ -490,11 +751,9 @@ function writeCash(cash) {
       !allCash ||
       typeof allCash !== "object" ||
       Array.isArray(allCash) ||
-      (
-        !Object.prototype.hasOwnProperty.call(allCash, "bishkek") &&
+      (!Object.prototype.hasOwnProperty.call(allCash, "bishkek") &&
         !Object.prototype.hasOwnProperty.call(allCash, "dordoy") &&
-        !Object.prototype.hasOwnProperty.call(allCash, "osh")
-      )
+        !Object.prototype.hasOwnProperty.call(allCash, "osh"))
     ) {
       allCash = {
         bishkek: {
@@ -515,11 +774,7 @@ function writeCash(cash) {
     // Записываем ТОЛЬКО текущий филиал
     allCash[branchKey] = cash;
 
-    fs.writeFileSync(
-      CASH_FILE,
-      JSON.stringify(allCash, null, 2),
-      "utf8"
-    );
+    fs.writeFileSync(CASH_FILE, JSON.stringify(allCash, null, 2), "utf8");
   } catch (error) {
     console.error("writeCash Ошибка:", error);
     throw error;
@@ -639,9 +894,7 @@ function addReturnToCash(
 
       returnDocumentId: returnDocumentId || null,
 
-      comment: isCancellation
-        ? "Отмена платежа"
-        : "Возврат денег за товар",
+      comment: isCancellation ? "Отмена платежа" : "Возврат денег за товар",
 
       createdAt: new Date().toISOString(),
     };
@@ -666,10 +919,7 @@ function addReturnToCash(
 }
 function readReturns() {
   try {
-    return readBranchData(
-      RETURNS_FILE,
-      [],
-    );
+    return readBranchData(RETURNS_FILE, []);
   } catch (error) {
     console.error("Ошибка чтения returns.json:", error);
 
@@ -679,11 +929,7 @@ function readReturns() {
 
 function writeReturns(returns) {
   try {
-    writeBranchData(
-      RETURNS_FILE,
-      returns,
-      [],
-    );
+    writeBranchData(RETURNS_FILE, returns, []);
   } catch (error) {
     console.error("Ошибка записи returns.json:", error);
 
@@ -1190,87 +1436,123 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
   }
 });
 
+
 async function calculateBundleStock(bundle, stockRows) {
   try {
-    const bundleId = bundle.id;
+    const bundleId = bundle.id || bundle.meta?.href?.split("/").pop();
 
     if (!bundleId) {
+      console.warn(
+        `[Комплект] Не удалось определить ID: "${bundle.name}"`,
+      );
       return 0;
     }
 
     const components = await getBundleComponents(bundleId);
 
-    if (components.length === 0) {
+    if (!Array.isArray(components) || components.length === 0) {
+      console.warn(
+        `[Комплект] "${bundle.name}": состав не найден`,
+      );
       return 0;
     }
 
     let possibleBundles = Infinity;
+    let validComponents = 0;
 
     for (const component of components) {
-      const componentQuantity = Number(component.quantity || 0);
+      const componentQuantity = Number(component.quantity);
 
       if (!Number.isFinite(componentQuantity) || componentQuantity <= 0) {
-        continue;
-      }
-
-      const componentMeta = component.assortment?.meta;
-
-      if (!componentMeta?.href) {
         console.warn(
-          `У компонента комплекта "${bundle.name}" нет assortment.meta`,
+          `[Комплект] "${bundle.name}": некорректное количество компонента`,
           component,
         );
-
         return 0;
       }
 
-      const componentHref = componentMeta.href.split("?")[0];
+      const componentMeta = component.assortment?.meta;
+      const componentHref = componentMeta?.href;
 
-      const componentId = componentHref.split("/").pop();
+      if (!componentHref) {
+        console.warn(
+          `[Комплект] "${bundle.name}": отсутствует ссылка на компонент`,
+          component,
+        );
+        return 0;
+      }
+
+      const cleanHref = componentHref.split("?")[0].replace(/\/+$/, "");
+      const componentId = cleanHref.split("/").pop();
+      const componentType = componentMeta.type;
 
       const stockItem = stockRows.find((item) => {
-        const href = item.meta?.href?.split("?")[0];
+        const itemHref = item.meta?.href
+          ?.split("?")[0]
+          .replace(/\/+$/, "");
 
-        const id = href?.split("/").pop();
+        if (!itemHref) {
+          return false;
+        }
+
+        const itemId = itemHref.split("/").pop();
 
         return (
-          id === componentId &&
-          (item.meta?.type === componentMeta.type || !componentMeta.type)
+          itemId === componentId &&
+          (!componentType || item.meta?.type === componentType)
         );
       });
 
-      const stock = Number(stockItem?.stock || 0);
+      const stock = Number(stockItem?.stock ?? 0);
 
-      /*
-       * Сколько комплектов можно собрать
-       * из этого компонента
-       */
+      if (!stockItem) {
+        console.warn(
+          `[Комплект] "${bundle.name}": компонент не найден в отчёте остатков`,
+          {
+            componentId,
+            componentType,
+            componentHref,
+            componentName: component.assortment?.name,
+          },
+        );
+      }
 
-      const componentBundles = Math.floor(stock / componentQuantity);
+      const availableBundles = Math.floor(stock / componentQuantity);
 
-      possibleBundles = Math.min(possibleBundles, componentBundles);
+      console.log(`[Комплект] ${bundle.name}`, {
+        component: component.assortment?.name || componentId,
+        componentQuantity,
+        componentStock: stock,
+        availableBundles,
+      });
 
-      /*
-       * Если хотя бы одного компонента нет —
-       * комплектов тоже нет.
-       */
+      possibleBundles = Math.min(
+        possibleBundles,
+        availableBundles,
+      );
+
+      validComponents++;
 
       if (possibleBundles <= 0) {
         return 0;
       }
     }
 
-    if (!Number.isFinite(possibleBundles)) {
+    if (validComponents === 0 || !Number.isFinite(possibleBundles)) {
       return 0;
     }
 
     return possibleBundles;
   } catch (error) {
-    console.error(`Ошибка расчёта остатка комплекта "${bundle.name}":`, error);
+    console.error(
+      `[Комплект] Ошибка расчёта "${bundle.name}":`,
+      error,
+    );
 
     return 0;
   }
 }
+
 
 const bundleComponentsCache = new Map();
 
@@ -1875,33 +2157,33 @@ function validatePayment(payment, total) {
     throw new Error("Не указана информация об оплате");
   }
 
-  const cash = Number(payment.cash || 0);
-  const card = Number(payment.card || 0);
-  const amanat = Number(payment.amanat || 0);
-  const mplus = Number(payment.mplus || 0);
-  const online_qr = Number(payment.online_qr || 0);
+  const fields = ["cash", "card", "amanat", "mplus", "online_qr", "cashbox"];
 
-  const values = [cash, card, amanat, mplus, online_qr];
+  const normalized = {};
 
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
-    throw new Error("Суммы оплаты должны быть положительными числами");
+  for (const field of fields) {
+    const value = Number(payment[field] ?? 0);
+
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Некорректная сумма оплаты: ${field}`);
+    }
+
+    normalized[field] = value;
   }
 
-  const paymentTotal = cash + card + amanat + mplus + online_qr;
+  const paymentTotal = fields.reduce(
+    (sum, field) => sum + normalized[field],
+    0,
+  );
 
-  if (Math.round(paymentTotal) !== Math.round(total)) {
+  if (paymentTotal !== Math.round(Number(total))) {
     throw new Error(
       `Сумма оплаты (${paymentTotal}) не равна сумме заказа (${total})`,
     );
   }
 
   return {
-    cash,
-    card,
-    amanat,
-    mplus,
-    online_qr,
-
+    ...normalized,
     paymentTotal,
   };
 }
@@ -1920,6 +2202,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
       salespersonId,
       salesperson,
       retailShiftSyncId,
+      cashboxEntryId,
     } = req.body;
 
     const branch = getCurrentBranch();
@@ -1963,7 +2246,11 @@ app.post("/api/moysklad/sales", async (req, res) => {
       ----------------------------------------- */
 
     const normalizedPayment = validatePayment(payment, normalizedTotal);
-
+    const cashboxPerson = await getCashboxPersonForSale(
+      cashboxEntryId,
+      payment,
+      normalizedTotal,
+    );
     /* -----------------------------------------
          RETAIL STORE
       ----------------------------------------- */
@@ -2038,7 +2325,8 @@ app.post("/api/moysklad/sales", async (req, res) => {
       normalizedPayment.card +
       normalizedPayment.amanat +
       normalizedPayment.mplus +
-      normalizedPayment.online_qr;
+      normalizedPayment.online_qr +
+      normalizedPayment.cashbox;
 
     /* -----------------------------------------
          ТЕКСТ ОПЛАТЫ
@@ -2058,6 +2346,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
       `М+: ${(normalizedPayment.mplus / 100).toFixed(2)} сом`,
 
       `Онлайн QR: ${(normalizedPayment.online_qr / 100).toFixed(2)} сом`,
+      `Бюджет: ${(normalizedPayment.cashbox / 100).toFixed(2)} сом`,
 
       `Итого: ${(normalizedTotal / 100).toFixed(2)} сом`,
     ].join("\n");
@@ -2216,6 +2505,8 @@ app.post("/api/moysklad/sales", async (req, res) => {
         amanatSom: normalizedPayment.amanat / 100,
         mplusSom: normalizedPayment.mplus / 100,
         online_qrSom: normalizedPayment.online_qr / 100,
+        cashbox: normalizedPayment.cashbox,
+        cashboxSom: normalizedPayment.cashbox / 100,
 
         paymentTotal: normalizedPayment.paymentTotal,
       },
@@ -2255,6 +2546,10 @@ app.post("/api/moysklad/sales", async (req, res) => {
 
       // Время
       createdAt: new Date().toISOString(),
+      cashboxEntryId: cashboxPerson?.id || null,
+      cashboxPersonName: cashboxPerson?.name || null,
+      cashboxAmount: normalizedPayment.cashbox,
+      cashboxAmountSom: normalizedPayment.cashbox / 100,
 
       // // Полный документ, который отправили в МойСклад
       // moyskladRequest: retailDemandData,
@@ -2263,36 +2558,44 @@ app.post("/api/moysklad/sales", async (req, res) => {
       // moyskladResponse: retailDemand,
     };
 
-    try {
-      saveSale(localSale);
+ try {
+  // 1. Сохраняем продажу локально
+  saveSale(localSale);
 
-      // =========================================================
-      // ДОБАВЛЯЕМ НАЛИЧНУЮ ОПЛАТУ В CASH.JSON
-      // =========================================================
+  // 2. Добавляем в кассу только реальные наличные
+  addSaleToCash(
+    localSale.moyskladPayment.cashSum,
+    salesperson,
+    localSale.orderId,
+  );
 
-      const cashTransaction = addSaleToCash(
-        localSale.moyskladPayment.cashSum,
-        salesperson,
-        localSale.orderId,
-      );
-    } catch (localSaveError) {
-      console.error("Ошибка локального сохранения продажи:", localSaveError);
+  // 3. Переводим человека из «Ожидание» в «Получено»
+  if (cashboxPerson) {
+    await markCashboxPersonReceived(
+      cashboxPerson.id,
+      localSale.id,
+    );
+  }
+} catch (localSaveError) {
+  console.error(
+    "Ошибка локального сохранения продажи:",
+    localSaveError,
+  );
 
-      // Продажа уже создана в МойСклад,
-      // поэтому не возвращаем ошибку создания продажи.
-      return res.status(201).json({
-        success: true,
-        localSaved: false,
-        warning: "Продажа создана в МойСклад, но не сохранена локально",
-        orderId,
-        demandId: retailDemand.id,
-        payment: normalizedPayment,
-        retailStoreId,
-        retailShiftSyncId,
-        retailShiftId: retailShift.id,
-        retailDemand,
-      });
-    }
+  return res.status(201).json({
+    success: true,
+    localSaved: false,
+    warning:
+      "Продажа создана в МойСклад, но локальное сохранение или обновление бюджета завершилось ошибкой",
+    orderId,
+    demandId: retailDemand.id,
+    payment: normalizedPayment,
+    retailStoreId,
+    retailShiftSyncId,
+    retailShiftId: retailShift.id,
+    retailDemand,
+  });
+}
 
     return res.status(201).json({
       success: true,
@@ -2460,6 +2763,10 @@ app.patch("/api/moysklad/sales/:saleId/cancel", async (req, res) => {
 
       cancellationReason: req.body?.reason || "Продажа отменена кассиром",
     };
+
+    if (foundSale.cashboxEntryId) {
+      await restoreCashboxPersonAfterCancellation(foundSale);
+    }
 
     // ---------------------------------------------------------
     // 9. Обновляем продажу в существующем массиве
@@ -3013,10 +3320,6 @@ app.post("/api/moysklad/returns", async (req, res) => {
       },
     );
 
-    /* ==========================================
-       СПИСЫВАЕМ ДЕНЬГИ ИЗ ЛОКАЛЬНОЙ КАССЫ
-    ========================================== */
-
     let cashTransaction = null;
 
     if (localCashSum > 0) {
@@ -3032,10 +3335,6 @@ app.post("/api/moysklad/returns", async (req, res) => {
       console.log("Возврат без наличных — cash.json не изменяется");
     }
 
-    /* ==========================================
-       СОХРАНЯЕМ В data/returns.json
-    ========================================== */
-
     const RETURNS_FILE = path.join(DATA_DIR, "returns.json");
 
     if (!fs.existsSync(DATA_DIR)) {
@@ -3046,7 +3345,7 @@ app.post("/api/moysklad/returns", async (req, res) => {
 
     /* Читаем существующие возвраты */
 
-   let returns = readReturns();
+    let returns = readReturns();
 
     /* ==========================================
        СОЗДАЁМ ЛОКАЛЬНУЮ ЗАПИСЬ
@@ -3103,31 +3402,13 @@ app.post("/api/moysklad/returns", async (req, res) => {
       }),
     };
 
-    /* ==========================================
-       ДОБАВЛЯЕМ НОВЫЙ ВОЗВРАТ
-    ========================================== */
-
     returns.push(returnRecord);
-
-    /* ==========================================
-       СОРТИРОВКА ПО ДАТЕ
-    ========================================== */
 
     returns.sort((a, b) => {
       return new Date(b.date).getTime() - new Date(a.date).getTime();
     });
 
-    /* ==========================================
-       СОХРАНЯЕМ returns.json
-    ========================================== */
-
-   writeReturns(returns);
-
-    console.log("Возврат сохранён в returns.json:", returnRecord);
-
-    /* ==========================================
-       УСПЕШНЫЙ ОТВЕТ
-    ========================================== */
+    writeReturns(returns);
 
     return res.status(201).json({
       success: true,

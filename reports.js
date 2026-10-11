@@ -266,6 +266,12 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     "onlineQr",
     "onlineQR",
   ]);
+  const cashboxSom =
+    payment.cashboxSom !== undefined &&
+    payment.cashboxSom !== null &&
+    payment.cashboxSom !== ""
+      ? Math.abs(toNumber(payment.cashboxSom))
+      : getPaymentAmount(payment, ["cashbox", "budget", "budgetPayment"]) / 100;
 
   const hasPaymentFields =
     cashKopecks > 0 ||
@@ -273,7 +279,8 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     amanatKopecks > 0 ||
     mplusKopecks > 0 ||
     localKopecks > 0 ||
-    onlineQrKopecks > 0;
+    onlineQrKopecks > 0 ||
+    cashboxSom > 0;
 
   if (hasPaymentFields) {
     const cash = cashKopecks / 100;
@@ -282,6 +289,7 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     const mplus = mplusKopecks / 100;
     const local = localKopecks / 100;
     const onlineQr = onlineQrKopecks / 100;
+    salesByPayment.cashbox += cashboxSom;
 
     salesByPayment.cash += cash;
     salesByPayment.card += card;
@@ -290,7 +298,7 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     salesByPayment.local += local;
     salesByPayment.online_qr += onlineQr;
 
-    return cash + card + amanat + mplus + local + onlineQr;
+    return cash + card + amanat + mplus + local + onlineQr + cashboxSom;
   }
 
   const method =
@@ -355,6 +363,16 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
 
     case "cash":
     case "наличные":
+  salesByPayment.cash += amount;
+  break;
+    case "cashbox":
+    case "budget":
+    case "budgetpayment":
+    case "budget_payment":
+    case "касса (бюджет)":
+    case "касса бюджет":
+      salesByPayment.cashbox += amount;
+      break;
     case "":
     default:
       salesByPayment.cash += amount;
@@ -705,6 +723,7 @@ router.get("/", async (req, res) => {
       mplus: 0,
       local: 0,
       online_qr: 0,
+      cashbox: 0,
     };
 
     /*
@@ -757,26 +776,30 @@ router.get("/", async (req, res) => {
       salesByPayment.amanat +
       salesByPayment.mplus +
       salesByPayment.local +
-      salesByPayment.online_qr;
+      salesByPayment.online_qr +
+  salesByPayment.cashbox;
 
-    if (
-      filteredSales.length > 0 &&
-      paymentTotalFromSales === 0 &&
-      cashSaleTransactions.length > 0
-    ) {
-      salesByPayment.cash = 0;
-      salesByPayment.card = 0;
-      salesByPayment.amanat = 0;
-      salesByPayment.mplus = 0;
-      salesByPayment.local = 0;
-      salesByPayment.online_qr = 0;
+  
+if (
+  filteredSales.length > 0 &&
+  paymentTotalFromSales === 0 &&
+  cashSaleTransactions.length > 0
+) {
+  salesByPayment.cash = 0;
+  salesByPayment.card = 0;
+  salesByPayment.amanat = 0;
+  salesByPayment.mplus = 0;
+  salesByPayment.local = 0;
+  salesByPayment.online_qr = 0;
+  salesByPayment.cashbox = 0;
 
-      cashSaleTransactions.forEach((transaction) => {
-        const amount = Math.abs(toNumber(transaction.amount));
+  cashSaleTransactions.forEach((transaction) => {
+    const amount = Math.abs(toNumber(transaction.amount));
 
-        addPaymentToSummary(salesByPayment, transaction, amount);
-      });
-    }
+    addPaymentToSummary(salesByPayment, transaction, amount);
+  });
+}
+
 
     /*
     |--------------------------------------------------------------------------
@@ -1223,16 +1246,15 @@ router.post("/send-telegram", upload.single("file"), async (req, res) => {
   try {
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     const branch = getCurrentBranch();
-   const branchKey = String(branch.id).toLowerCase();
+    const branchKey = String(branch.id).toLowerCase();
 
-   
     const telegramChatIds = {
-  bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
-  dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
-  osh: process.env.TELEGRAM_CHAT_ID_OSH,
-};
+      bishkek: process.env.TELEGRAM_CHAT_ID_BISHKEK,
+      dordoy: process.env.TELEGRAM_CHAT_ID_DORDOY,
+      osh: process.env.TELEGRAM_CHAT_ID_OSH,
+    };
 
-const chatId = telegramChatIds[branchKey];
+    const chatId = telegramChatIds[branchKey];
 
     if (!botToken) {
       return res.status(500).json({
