@@ -1,7 +1,7 @@
-
 const express = require("express");
 const fs = require("fs/promises");
 const path = require("path");
+const { getCurrentBranch } = require("./branchContext");
 
 const router = express.Router();
 
@@ -16,13 +16,15 @@ const DATA_DIR = path.join(__dirname, "..", "data");
 const SALES_FILE = path.join(DATA_DIR, "sales.json");
 const RESERVATIONS_FILE = path.join(DATA_DIR, "reservations.json");
 
+const BRANCHES = ["bishkek", "dordoy", "osh"];
+
 /*
 |--------------------------------------------------------------------------
 | HELPERS
 |--------------------------------------------------------------------------
 */
 
-async function readJsonFile(filePath, fallback = []) {
+async function readJsonFile(filePath, fallback = {}) {
   try {
     const data = await fs.readFile(filePath, "utf8");
 
@@ -42,32 +44,120 @@ async function readJsonFile(filePath, fallback = []) {
 
 function toNumber(value) {
   const number = Number(value);
-
   return Number.isFinite(number) ? number : 0;
 }
+
+function normalizeBranchKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+/*
+|--------------------------------------------------------------------------
+| CURRENT BRANCH KEY
+|--------------------------------------------------------------------------
+*/
+
+function getBranchKey(branch) {
+  const candidates = [branch?.key, branch?.code, branch?.slug, branch?.id];
+
+  for (const candidate of candidates) {
+    const key = normalizeBranchKey(candidate);
+
+    if (BRANCHES.includes(key)) {
+      return key;
+    }
+  }
+
+  const name = normalizeBranchKey(branch?.name || branch?.title);
+
+  if (name.includes("бишкек") || name.includes("bishkek")) {
+    return "bishkek";
+  }
+
+  if (name.includes("дордой") || name.includes("dordoy")) {
+    return "dordoy";
+  }
+
+  if (name.includes("ош") || name === "osh") {
+    return "osh";
+  }
+
+  throw new Error(`Не удалось определить филиал: ${JSON.stringify(branch)}`);
+}
+
+/*
+|--------------------------------------------------------------------------
+| RESERVATION BRANCH
+|--------------------------------------------------------------------------
+*/
+
+function getReservationBranchKey(reservation) {
+  const candidates = [
+    reservation?.branchKey,
+    reservation?.branchId,
+    reservation?.branch,
+    reservation?.branchName,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") {
+      const key = normalizeBranchKey(candidate);
+
+      if (BRANCHES.includes(key)) {
+        return key;
+      }
+
+      if (key.includes("бишкек") || key.includes("bishkek")) {
+        return "bishkek";
+      }
+
+      if (key.includes("дордой") || key.includes("dordoy")) {
+        return "dordoy";
+      }
+
+      if (key === "ош" || key === "osh") {
+        return "osh";
+      }
+    }
+
+    if (candidate && typeof candidate === "object") {
+      try {
+        return getBranchKey(candidate);
+      } catch {
+        // Проверяем следующее поле филиала.
+      }
+    }
+  }
+
+  return null;
+}
+
+/*
+|--------------------------------------------------------------------------
+| AMANAT AMOUNTS
+|--------------------------------------------------------------------------
+|
+| sales.json:
+| payment.amanatSom -> сомы
+| payment.amanat    -> тыйыны, если amanatSom отсутствует
+|
+| reservations.json:
+| payments.amanat -> сомы
+|--------------------------------------------------------------------------
+*/
 
 function getAmanatFromPayment(payment) {
   if (!payment) {
     return 0;
   }
 
-  /*
-   * В sales.json:
-   *
-   * payment.amanat       -> сумма в сомах
-   * payment.amanatSom    -> сумма в сомах
-   *
-   * Поэтому сначала смотрим amanatSom.
-   */
-
-  if (payment.amanatSom !== undefined) {
+  if (payment.amanatSom !== undefined && payment.amanatSom !== null) {
     return toNumber(payment.amanatSom);
   }
 
-  if (payment.amanat !== undefined) {
-    /*
-     * Для sales.json amanat хранится в копейках.
-     */
+  if (payment.amanat !== undefined && payment.amanat !== null) {
     return toNumber(payment.amanat) / 100;
   }
 
@@ -75,37 +165,43 @@ function getAmanatFromPayment(payment) {
 }
 
 function getAmanatFromReservation(reservation) {
-  if (!reservation) {
-    return 0;
-  }
-
-  /*
-   * В reservations.json:
-   *
-   * payments.amanat -> сразу сомы
-   */
-
-  return toNumber(reservation.payments?.amanat);
+  return toNumber(reservation?.payments?.amanat);
 }
-
 
 /*
 |--------------------------------------------------------------------------
-| GET /api/moysklad/amanat
+| PAYMENT NORMALIZATION
 |--------------------------------------------------------------------------
-|
-| Пример:
-|
-| GET /api/moysklad/amanat
-|     ?from=2026-09-01
-|     &to=2026-09-30
-|
+*/
+
+function getSalePaymentAmount(payment, somKey, legacyKey) {
+  if (!payment) {
+    return 0;
+  }
+
+  if (payment[somKey] !== undefined && payment[somKey] !== null) {
+    return toNumber(payment[somKey]);
+  }
+
+  // Старые поля cash/card/mplus хранятся в тыйынах.
+  return toNumber(payment[legacyKey]) / 100;
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/moysklad/amanat?from=YYYY-MM-DD&to=YYYY-MM-DD
 |--------------------------------------------------------------------------
 */
 
 router.get("/amanat", async (req, res) => {
   try {
     const { from, to } = req.query;
+
+    /*
+    |--------------------------------------------------------------------------
+    | VALIDATE DATES
+    |--------------------------------------------------------------------------
+    */
 
     if (!from || !to) {
       return res.status(400).json({
@@ -114,20 +210,27 @@ router.get("/amanat", async (req, res) => {
       });
     }
 
-    /*
-     * Проверяем даты.
-     */
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 
-    const fromDate = new Date(`${from}T00:00:00`);
-    const toDate = new Date(`${to}T23:59:59`);
-
-    if (
-      Number.isNaN(fromDate.getTime()) ||
-      Number.isNaN(toDate.getTime())
-    ) {
+    if (!datePattern.test(from) || !datePattern.test(to)) {
       return res.status(400).json({
         success: false,
         message: "Неверный формат даты. Используйте YYYY-MM-DD",
+      });
+    }
+
+    const fromDate = new Date(`${from}T00:00:00Z`);
+    const toDate = new Date(`${to}T00:00:00Z`);
+
+    if (
+      Number.isNaN(fromDate.getTime()) ||
+      Number.isNaN(toDate.getTime()) ||
+      fromDate.toISOString().slice(0, 10) !== from ||
+      toDate.toISOString().slice(0, 10) !== to
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Указана некорректная дата",
       });
     }
 
@@ -139,41 +242,56 @@ router.get("/amanat", async (req, res) => {
     }
 
     /*
-     * Загружаем оба файла.
-     */
+    |--------------------------------------------------------------------------
+    | CURRENT BRANCH
+    |--------------------------------------------------------------------------
+    */
 
-    const salesData = await readJsonFile(SALES_FILE, {});
-    const reservationsData = await readJsonFile(
-      RESERVATIONS_FILE,
-      [],
-    );
+    const branch = getCurrentBranch();
+    const branchKey = getBranchKey(branch);
+
+    /*
+    |--------------------------------------------------------------------------
+    | LOAD FILES
+    |--------------------------------------------------------------------------
+    */
+
+    const [salesData, reservationsData] = await Promise.all([
+      readJsonFile(SALES_FILE, {}),
+      readJsonFile(RESERVATIONS_FILE, []),
+    ]);
 
     const result = [];
 
     /*
     |--------------------------------------------------------------------------
-    | SALES
+    | SALES: CURRENT BRANCH ONLY
     |--------------------------------------------------------------------------
     |
-    | sales.json имеет структуру:
+    | Ожидаемая структура sales.json:
     |
     | {
-    |   "2026-09-23": [],
-    |   "2026-09-24": []
+    |   "bishkek": {
+    |     "2026-09-28": [...]
+    |   },
+    |   "dordoy": {
+    |     "2026-09-28": [...]
+    |   },
+    |   "osh": {
+    |     "2026-09-28": [...]
+    |   }
     | }
-    |
+    |--------------------------------------------------------------------------
     */
 
-    if (
-      salesData &&
-      typeof salesData === "object" &&
-      !Array.isArray(salesData)
-    ) {
-      for (const [date, sales] of Object.entries(salesData)) {
-        /*
-         * Сначала проверяем дату.
-         */
+    const salesByDate = salesData?.[branchKey] || {};
 
+    if (
+      salesByDate &&
+      typeof salesByDate === "object" &&
+      !Array.isArray(salesByDate)
+    ) {
+      for (const [date, sales] of Object.entries(salesByDate)) {
         if (date < from || date > to) {
           continue;
         }
@@ -183,14 +301,11 @@ router.get("/amanat", async (req, res) => {
         }
 
         for (const sale of sales) {
-          const amanat = getAmanatFromPayment(
-            sale.payment,
-          );
+          if (String(sale.status || "").toLowerCase() === "cancelled") {
+            continue;
+          }
 
-          /*
-           * В календарь попадают только продажи,
-           * где реально есть Аманат.
-           */
+          const amanat = getAmanatFromPayment(sale.payment);
 
           if (amanat <= 0) {
             continue;
@@ -199,13 +314,9 @@ router.get("/amanat", async (req, res) => {
           result.push({
             id: sale.id,
             type: "sale",
-
             date,
-
             createdAt: sale.createdAt || null,
-
             status: sale.status || "completed",
-
             orderId: sale.orderId || null,
 
             customerName:
@@ -214,62 +325,40 @@ router.get("/amanat", async (req, res) => {
               sale.agent?.name ||
               null,
 
-            customerPhone:
-              sale.customerPhone ||
-              sale.phone ||
-              null,
+            customerPhone: sale.customerPhone || sale.phone || null,
 
             total: toNumber(sale.totalSom),
-
             totalKopecks: toNumber(sale.totalKopecks),
 
             amanat,
-
             amanatKopecks: Math.round(amanat * 100),
 
-            paymentMethod:
-              sale.payment?.method || null,
+            paymentMethod: sale.payment?.method || null,
 
             payment: {
-              method:
-                sale.payment?.method || null,
+              method: sale.payment?.method || null,
 
-              cash: toNumber(
-                sale.payment?.cashSom ??
-                  sale.payment?.cash ??
-                  0,
-              ),
+              cash: getSalePaymentAmount(sale.payment, "cashSom", "cash"),
 
-              card: toNumber(
-                sale.payment?.cardSom ??
-                  sale.payment?.card ??
-                  0,
-              ),
+              card: getSalePaymentAmount(sale.payment, "cardSom", "card"),
 
               amanat,
 
-              mplus: toNumber(
-                sale.payment?.mplusSom ??
-                  sale.payment?.mplus ??
-                  0,
+              mplus: getSalePaymentAmount(sale.payment, "mplusSom", "mplus"),
+
+              online_qr: getSalePaymentAmount(
+                sale.payment,
+                "online_qrSom",
+                "online_qr",
               ),
             },
 
-            items: Array.isArray(sale.items)
-              ? sale.items
-              : [],
+            items: Array.isArray(sale.items) ? sale.items : [],
 
-            retailStoreId:
-              sale.retailStoreId || null,
-
-            storeId:
-              sale.storeId || null,
-
-            moyskladId:
-              sale.moyskladId || null,
-
-            moyskladName:
-              sale.moyskladName || null,
+            retailStoreId: sale.retailStoreId || null,
+            storeId: sale.storeId || null,
+            moyskladId: sale.moyskladId || null,
+            moyskladName: sale.moyskladName || null,
           });
         }
       }
@@ -277,150 +366,126 @@ router.get("/amanat", async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | RESERVATIONS
+    | RESERVATIONS: CURRENT BRANCH ONLY
+    |--------------------------------------------------------------------------
+    |
+    | Поддерживаем два формата reservations.json:
+    |
+    | 1. Массив броней с branchKey / branchId / branchName.
+    |
+    | 2. Объект, разделённый по филиалам:
+    |
+    | {
+    |   "bishkek": [...],
+    |   "dordoy": [...],
+    |   "osh": [...]
+    | }
+    |
+    | Также поддерживается объект с датами внутри филиала.
     |--------------------------------------------------------------------------
     */
 
+    let reservations = [];
+
     if (Array.isArray(reservationsData)) {
-      for (const reservation of reservationsData) {
-        const date = reservation.reservationDate;
+      // В общем массиве берём только брони текущего филиала.
+      reservations = reservationsData.filter(
+        (reservation) => getReservationBranchKey(reservation) === branchKey,
+      );
+    } else if (reservationsData && typeof reservationsData === "object") {
+      const branchReservations = reservationsData[branchKey];
 
-        if (!date) {
-          continue;
-        }
+      if (Array.isArray(branchReservations)) {
+        reservations = branchReservations;
+      } else if (branchReservations && typeof branchReservations === "object") {
+        // Формат: филиал -> дата -> массив броней.
+        reservations = Object.entries(branchReservations).flatMap(
+          ([date, items]) => {
+            if (!Array.isArray(items)) {
+              return [];
+            }
 
-        /*
-         * Проверяем период.
-         */
-
-        if (date < from || date > to) {
-          continue;
-        }
-
-        /*
-         * ОТМЕНЁННЫЕ БРОНИ НЕ ПОКАЗЫВАЕМ.
-         */
-
-        if (
-          String(reservation.status).toLowerCase() ===
-          "cancelled"
-        ) {
-          continue;
-        }
-
-        const amanat = getAmanatFromReservation(
-          reservation,
-        );
-
-        /*
-         * Брони без Аманата не нужны.
-         */
-
-        if (amanat <= 0) {
-          continue;
-        }
-
-        result.push({
-          id: reservation.id,
-
-          type: "reservation",
-
-          date,
-
-          createdAt:
-            reservation.createdAt || null,
-
-          updatedAt:
-            reservation.updatedAt || null,
-
-          status:
-            reservation.status || null,
-
-          orderId: null,
-
-          customerName:
-            reservation.customerName || "Без клиента",
-
-          customerPhone:
-            reservation.customerPhone || null,
-
-          total: toNumber(reservation.total),
-
-          totalKopecks: Math.round(
-            toNumber(reservation.total) * 100,
-          ),
-
-          amanat,
-
-          amanatKopecks: Math.round(
-            amanat * 100,
-          ),
-
-          paymentMethod:
-            reservation.paymentMethod || null,
-
-          payment: {
-            method:
-              reservation.paymentMethod || null,
-
-            cash: toNumber(
-              reservation.payments?.cash,
-            ),
-
-            card: toNumber(
-              reservation.payments?.card,
-            ),
-
-            amanat,
-
-            mplus: toNumber(
-              reservation.payments?.mplus,
-            ),
+            return items.map((reservation) => ({
+              ...reservation,
+              reservationDate: reservation.reservationDate || date,
+            }));
           },
-
-          paid: toNumber(reservation.paid),
-
-          remaining: toNumber(
-            reservation.remaining,
-          ),
-
-          paymentStatus:
-            reservation.paymentStatus || null,
-
-          comment:
-            reservation.comment || "",
-
-          items: Array.isArray(
-            reservation.items,
-          )
-            ? reservation.items
-            : [],
-
-          paymentHistory: Array.isArray(
-            reservation.paymentHistory,
-          )
-            ? reservation.paymentHistory
-            : [],
-        });
+        );
       }
+    }
+
+    for (const reservation of reservations) {
+      const date = reservation.reservationDate;
+
+      if (!date || date < from || date > to) {
+        continue;
+      }
+
+      if (String(reservation.status || "").toLowerCase() === "cancelled") {
+        continue;
+      }
+
+      const amanat = getAmanatFromReservation(reservation);
+
+      if (amanat <= 0) {
+        continue;
+      }
+
+      result.push({
+        id: reservation.id,
+        type: "reservation",
+        date,
+
+        createdAt: reservation.createdAt || null,
+        updatedAt: reservation.updatedAt || null,
+        status: reservation.status || null,
+
+        orderId: null,
+
+        customerName: reservation.customerName || "Без клиента",
+        customerPhone: reservation.customerPhone || null,
+
+        total: toNumber(reservation.total),
+        totalKopecks: Math.round(toNumber(reservation.total) * 100),
+
+        amanat,
+        amanatKopecks: Math.round(amanat * 100),
+
+        paymentMethod: reservation.paymentMethod || null,
+
+        payment: {
+          method: reservation.paymentMethod || null,
+          cash: toNumber(reservation.payments?.cash),
+          card: toNumber(reservation.payments?.card),
+          amanat,
+          mplus: toNumber(reservation.payments?.mplus),
+          online_qr: toNumber(reservation.payments?.online_qr),
+        },
+
+        paid: toNumber(reservation.paid),
+        remaining: toNumber(reservation.remaining),
+
+        paymentStatus: reservation.paymentStatus || null,
+        comment: reservation.comment || "",
+
+        items: Array.isArray(reservation.items) ? reservation.items : [],
+
+        paymentHistory: Array.isArray(reservation.paymentHistory)
+          ? reservation.paymentHistory
+          : [],
+      });
     }
 
     /*
     |--------------------------------------------------------------------------
-    | SORT
+    | SORT: NEWEST FIRST
     |--------------------------------------------------------------------------
-    |
-    | Сначала новые операции.
     */
 
     result.sort((a, b) => {
-      const dateA = new Date(
-        a.createdAt || `${a.date}T00:00:00`,
-      );
+      const dateA = new Date(a.createdAt || `${a.date}T00:00:00`);
 
-      const dateB = new Date(
-        b.createdAt || `${b.date}T00:00:00`,
-      );
+      const dateB = new Date(b.createdAt || `${b.date}T00:00:00`);
 
       return dateB - dateA;
     });
@@ -431,25 +496,12 @@ router.get("/amanat", async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const total = result.reduce(
-      (sum, item) => sum + item.amanat,
-      0,
-    );
+    const total = result.reduce((sum, item) => sum + item.amanat, 0);
 
     /*
     |--------------------------------------------------------------------------
     | DAILY TOTALS
     |--------------------------------------------------------------------------
-    |
-    | Это сразу удобно для календаря.
-    |
-    | {
-    |   "2026-09-24": {
-    |      amount: 5500,
-    |      count: 2
-    |   }
-    | }
-    |
     */
 
     const daily = {};
@@ -466,6 +518,11 @@ router.get("/amanat", async (req, res) => {
       daily[item.date].count += 1;
     }
 
+    // Округляем дневные суммы до двух знаков после запятой.
+    for (const day of Object.values(daily)) {
+      day.amount = Math.round(day.amount * 100) / 100;
+    }
+
     /*
     |--------------------------------------------------------------------------
     | RESPONSE
@@ -474,32 +531,23 @@ router.get("/amanat", async (req, res) => {
 
     return res.json({
       success: true,
-
+      branch: branchKey,
       from,
-
       to,
 
-      total,
-
+      total: Math.round(total * 100) / 100,
       totalKopecks: Math.round(total * 100),
 
       count: result.length,
-
       daily,
-
       items: result,
     });
   } catch (error) {
-    console.error(
-      "Ошибка получения Аманата:",
-      error,
-    );
+    console.error("Ошибка получения Аманата:", error);
 
     return res.status(500).json({
       success: false,
-      message:
-        error.message ||
-        "Ошибка получения данных Аманата",
+      message: error.message || "Ошибка получения данных Аманата",
     });
   }
 });
