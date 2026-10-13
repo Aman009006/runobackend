@@ -20,7 +20,7 @@ app.use(
     ],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization","x-admin-stats-token",],
   }),
 );
 
@@ -29,9 +29,15 @@ app.use(express.json());
 // ========================================
 // AUTH
 // ========================================
+const adminStatisticsRouter = require("./adminStatistics");
+app.use("/api/admin-statistics", adminStatisticsRouter);
 
-// Авторизация доступна без авторизации
+// Обычная авторизация
 app.use("/api/auth", authRouter);
+
+// Административная статистика подключается ДО общей авторизации
+// Авторизация доступна без авторизации
+// app.use("/api/auth", authRouter);
 
 // ========================================
 // PROTECTED API
@@ -250,9 +256,7 @@ async function markCashboxPersonReceived(entryId, saleId) {
   );
 
   if (!person) {
-    throw new Error(
-      `Запись бюджета ${entryId} не найдена`,
-    );
+    throw new Error(`Запись бюджета ${entryId} не найдена`);
   }
 
   // Защита от повторного списания
@@ -290,10 +294,7 @@ async function markCashboxPersonReceived(entryId, saleId) {
 
   const spent = database.people
     .filter((item) => item.status === "received")
-    .reduce(
-      (sum, item) => sum + Number(item.amount || 0),
-      0,
-    );
+    .reduce((sum, item) => sum + Number(item.amount || 0), 0);
 
   const roundMoney = (value) =>
     Math.round((value + Number.EPSILON) * 100) / 100;
@@ -330,13 +331,8 @@ async function markCashboxPersonReceived(entryId, saleId) {
       createdAt: item.receivedAt || item.createdAt,
     }));
 
-  database.transactions = [
-    ...topupTransactions,
-    ...issuedTransactions,
-  ].sort(
-    (a, b) =>
-      new Date(b.createdAt || 0) -
-      new Date(a.createdAt || 0),
+  database.transactions = [...topupTransactions, ...issuedTransactions].sort(
+    (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
   );
 
   await writeCashboxBudget(database);
@@ -1436,24 +1432,19 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
   }
 });
 
-
 async function calculateBundleStock(bundle, stockRows) {
   try {
     const bundleId = bundle.id || bundle.meta?.href?.split("/").pop();
 
     if (!bundleId) {
-      console.warn(
-        `[Комплект] Не удалось определить ID: "${bundle.name}"`,
-      );
+      console.warn(`[Комплект] Не удалось определить ID: "${bundle.name}"`);
       return 0;
     }
 
     const components = await getBundleComponents(bundleId);
 
     if (!Array.isArray(components) || components.length === 0) {
-      console.warn(
-        `[Комплект] "${bundle.name}": состав не найден`,
-      );
+      console.warn(`[Комплект] "${bundle.name}": состав не найден`);
       return 0;
     }
 
@@ -1487,9 +1478,7 @@ async function calculateBundleStock(bundle, stockRows) {
       const componentType = componentMeta.type;
 
       const stockItem = stockRows.find((item) => {
-        const itemHref = item.meta?.href
-          ?.split("?")[0]
-          .replace(/\/+$/, "");
+        const itemHref = item.meta?.href?.split("?")[0].replace(/\/+$/, "");
 
         if (!itemHref) {
           return false;
@@ -1526,10 +1515,7 @@ async function calculateBundleStock(bundle, stockRows) {
         availableBundles,
       });
 
-      possibleBundles = Math.min(
-        possibleBundles,
-        availableBundles,
-      );
+      possibleBundles = Math.min(possibleBundles, availableBundles);
 
       validComponents++;
 
@@ -1544,15 +1530,11 @@ async function calculateBundleStock(bundle, stockRows) {
 
     return possibleBundles;
   } catch (error) {
-    console.error(
-      `[Комплект] Ошибка расчёта "${bundle.name}":`,
-      error,
-    );
+    console.error(`[Комплект] Ошибка расчёта "${bundle.name}":`, error);
 
     return 0;
   }
 }
-
 
 const bundleComponentsCache = new Map();
 
@@ -2558,44 +2540,38 @@ app.post("/api/moysklad/sales", async (req, res) => {
       // moyskladResponse: retailDemand,
     };
 
- try {
-  // 1. Сохраняем продажу локально
-  saveSale(localSale);
+    try {
+      // 1. Сохраняем продажу локально
+      saveSale(localSale);
 
-  // 2. Добавляем в кассу только реальные наличные
-  addSaleToCash(
-    localSale.moyskladPayment.cashSum,
-    salesperson,
-    localSale.orderId,
-  );
+      // 2. Добавляем в кассу только реальные наличные
+      addSaleToCash(
+        localSale.moyskladPayment.cashSum,
+        salesperson,
+        localSale.orderId,
+      );
 
-  // 3. Переводим человека из «Ожидание» в «Получено»
-  if (cashboxPerson) {
-    await markCashboxPersonReceived(
-      cashboxPerson.id,
-      localSale.id,
-    );
-  }
-} catch (localSaveError) {
-  console.error(
-    "Ошибка локального сохранения продажи:",
-    localSaveError,
-  );
+      // 3. Переводим человека из «Ожидание» в «Получено»
+      if (cashboxPerson) {
+        await markCashboxPersonReceived(cashboxPerson.id, localSale.id);
+      }
+    } catch (localSaveError) {
+      console.error("Ошибка локального сохранения продажи:", localSaveError);
 
-  return res.status(201).json({
-    success: true,
-    localSaved: false,
-    warning:
-      "Продажа создана в МойСклад, но локальное сохранение или обновление бюджета завершилось ошибкой",
-    orderId,
-    demandId: retailDemand.id,
-    payment: normalizedPayment,
-    retailStoreId,
-    retailShiftSyncId,
-    retailShiftId: retailShift.id,
-    retailDemand,
-  });
-}
+      return res.status(201).json({
+        success: true,
+        localSaved: false,
+        warning:
+          "Продажа создана в МойСклад, но локальное сохранение или обновление бюджета завершилось ошибкой",
+        orderId,
+        demandId: retailDemand.id,
+        payment: normalizedPayment,
+        retailStoreId,
+        retailShiftSyncId,
+        retailShiftId: retailShift.id,
+        retailDemand,
+      });
+    }
 
     return res.status(201).json({
       success: true,
