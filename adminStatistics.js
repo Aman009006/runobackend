@@ -191,6 +191,7 @@ function getSellerName(sale) {
 
   return (
     salesperson?.name ||
+    salesperson?.id ||
     sale?.salespersonName ||
     sale?.sellerName ||
     "Не указан"
