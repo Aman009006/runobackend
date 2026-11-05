@@ -42,7 +42,8 @@ app.use("/api/auth", authRouter);
 // ========================================
 // PROTECTED API
 // ========================================
-
+const shopRouter = require("./shop.routes");
+app.use("/api/shop", shopRouter);
 // Всё остальное API требует входа
 app.use("/api", requireAuth);
 
