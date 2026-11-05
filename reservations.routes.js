@@ -1176,40 +1176,60 @@ router.patch("/:id", async (req, res) => {
       });
     }
 
-    const paymentHistory = [...ensurePaymentHistory(current)];
+   const paymentHistory = [...ensurePaymentHistory(current)];
 
-    const oldPaid = getPaymentHistoryPaid(paymentHistory);
+const oldPaid = getPaymentHistoryPaid(paymentHistory);
 
-    const overpayment = roundMoney(Math.max(0, oldPaid - newTotal));
+const overpayment = roundMoney(
+  Math.max(0, oldPaid - newTotal),
+);
 
-    if (overpayment > 0) {
-      paymentHistory.push(
-        buildPaymentHistoryEntry("refund", {
-          cash: overpayment,
+// Текущая разбивка оплаты
+const newPayments = normalizePayments(current.payments);
 
-          card: 0,
-          amanat: 0,
-          mplus: 0,
-          online_qr: 0,
-        }),
-      );
-    }
+// Уменьшаем распределение оплаты на сумму возврата.
+// Это нужно, чтобы сумма платежей совпадала с новой суммой брони.
+let refundLeft = overpayment;
 
-    const newPaid = Math.max(0, roundMoney(oldPaid - overpayment));
+for (const key of PAYMENT_KEYS) {
+  if (refundLeft <= 0) break;
 
-    const newRemaining = Math.max(0, roundMoney(newTotal - newPaid));
+  const deduction = Math.min(newPayments[key], refundLeft);
 
-    const newPayments = normalizePayments(current.payments);
+  newPayments[key] = roundMoney(
+    newPayments[key] - deduction,
+  );
 
-    if (overpayment > 0) {
-      newPayments.cash = Math.max(
-        0,
-        roundMoney(newPayments.cash - overpayment),
-      );
-    }
+  refundLeft = roundMoney(refundLeft - deduction);
+}
 
-    const updatedAt = getNow();
+if (refundLeft > 0) {
+  throw new Error(
+    `Не удалось распределить возврат: ${refundLeft} сом`,
+  );
+}
 
+// В истории возврат ВСЕГДА наличными
+if (overpayment > 0) {
+  paymentHistory.push(
+    buildPaymentHistoryEntry("refund", {
+      cash: overpayment,
+      card: 0,
+      amanat: 0,
+      mplus: 0,
+      online_qr: 0,
+    }),
+  );
+}
+
+const newPaid = getPaymentHistoryPaid(paymentHistory);
+
+const newRemaining = Math.max(
+  0,
+  roundMoney(newTotal - newPaid),
+);
+
+const updatedAt = getNow();
     const updatedReservation = {
       ...current,
 
