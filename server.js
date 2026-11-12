@@ -47,6 +47,10 @@ app.use("/api/shop", shopRouter);
 // Всё остальное API требует входа
 app.use("/api", requireAuth);
 
+const metaAdsRouter = require("./metaAds.routes");
+
+app.use("/api/meta-ads", metaAdsRouter);
+
 const writeoffRouter = require("./writeoff.routes");
 const personnelRouter = require("./personnel");
 
@@ -2139,8 +2143,15 @@ function validatePayment(payment, total) {
   if (!payment) {
     throw new Error("Не указана информация об оплате");
   }
-
-  const fields = ["cash", "card", "amanat", "mplus", "online_qr", "cashbox"];
+const fields = [
+  "cash",
+  "card",
+  "amanat",
+  "mplus",
+  "online_qr",
+  "obank_qr",
+  "cashbox",
+];
 
   const normalized = {};
 
@@ -2309,6 +2320,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
       normalizedPayment.amanat +
       normalizedPayment.mplus +
       normalizedPayment.online_qr +
+      normalizedPayment.obank_qr +
       normalizedPayment.cashbox;
 
     /* -----------------------------------------
@@ -2327,6 +2339,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
       `Аманат: ${(normalizedPayment.amanat / 100).toFixed(2)} сом`,
 
       `М+: ${(normalizedPayment.mplus / 100).toFixed(2)} сом`,
+      `О! Банк QR: ${(normalizedPayment.obank_qr / 100).toFixed(2)} сом`,
 
       `Онлайн QR: ${(normalizedPayment.online_qr / 100).toFixed(2)} сом`,
       `Бюджет: ${(normalizedPayment.cashbox / 100).toFixed(2)} сом`,
@@ -2490,7 +2503,8 @@ app.post("/api/moysklad/sales", async (req, res) => {
         online_qrSom: normalizedPayment.online_qr / 100,
         cashbox: normalizedPayment.cashbox,
         cashboxSom: normalizedPayment.cashbox / 100,
-
+obank_qr: normalizedPayment.obank_qr,
+obank_qrSom: normalizedPayment.obank_qr / 100,
         paymentTotal: normalizedPayment.paymentTotal,
       },
 
@@ -2503,6 +2517,7 @@ app.post("/api/moysklad/sales", async (req, res) => {
         amanat: normalizedPayment.amanat,
         mplus: normalizedPayment.mplus,
         online_qr: normalizedPayment.online_qr,
+        obank_qr: normalizedPayment.obank_qr,
       },
 
       // Касса и смена
@@ -3457,6 +3472,303 @@ app.get("/api/moysklad/debug-auth", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error.message,
+    });
+  }
+});
+
+// =========================================================
+// O! BANK / DENGI.KG QR PAYMENT
+// =========================================================
+
+const OBANK_PAYMENTS_FILE = path.join(DATA_DIR, "obankPayments.json");
+
+function readObankPayments() {
+  try {
+    if (!fs.existsSync(OBANK_PAYMENTS_FILE)) {
+      return {};
+    }
+
+    return JSON.parse(fs.readFileSync(OBANK_PAYMENTS_FILE, "utf8"));
+  } catch (error) {
+    console.error("Ошибка чтения obankPayments.json:", error);
+    return {};
+  }
+}
+
+function writeObankPayments(payments) {
+  fs.writeFileSync(
+    OBANK_PAYMENTS_FILE,
+    JSON.stringify(payments, null, 2),
+    "utf8",
+  );
+}
+
+function createDengiHash(payload) {
+  const secret = process.env.DENGI_API_PASSWORD;
+
+  if (!secret) {
+    throw new Error("DENGI_API_PASSWORD не указан в .env");
+  }
+
+  // JSON.stringify сохраняет порядок ключей и не добавляет пробелы.
+  // Пробел внутри date_life, если он есть, сохраняется.
+  const json = JSON.stringify(payload);
+
+  return crypto
+    .createHmac("md5", secret)
+    .update(json, "utf8")
+    .digest("hex");
+}
+
+async function dengiRequest(cmd, data) {
+  const sid = process.env.DENGI_SID;
+  const apiUrl = process.env.DENGI_API_URL;
+
+  if (!sid || !apiUrl) {
+    throw new Error("Не настроены DENGI_SID или DENGI_API_URL");
+  }
+
+  const payload = {
+    cmd,
+    version: 1005,
+    sid,
+    mktime: String(Math.floor(Date.now() / 1000)),
+    lang: "ru",
+    data,
+  };
+
+  const requestBody = {
+    ...payload,
+    hash: createDengiHash(payload),
+  };
+
+  const response = await fetch(apiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result?.message || result?.error || "Ошибка запроса Dengi.kg",
+    );
+  }
+
+  if (result?.error || result?.success === false) {
+    throw new Error(
+      result.message || result.error || "Dengi.kg отклонил запрос",
+    );
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------
+// СОЗДАНИЕ ДИНАМИЧЕСКОГО QR
+// ---------------------------------------------------------
+
+app.post("/api/obank/create-invoice", async (req, res) => {
+  try {
+    const { orderId, amount } = req.body;
+
+    if (!orderId || !Number.isSafeInteger(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Некорректный номер заказа или сумма",
+      });
+    }
+
+    const normalizedAmount = Number(amount);
+    const payments = readObankPayments();
+
+    // Повторный запрос с тем же orderId не должен создавать новый счёт.
+    const existing = payments[String(orderId)];
+
+    if (existing?.invoiceId && existing.status === "processing") {
+      return res.json({
+        success: true,
+        orderId,
+        invoiceId: existing.invoiceId,
+        qrCode: existing.qrCode,
+        amount: existing.amount / 100,
+        status: existing.status,
+      });
+    }
+
+    const dateLife = new Date(Date.now() + 15 * 60 * 1000);
+
+    const dateLifeKyrgyzstan = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: "Asia/Bishkek",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    })
+      .format(dateLife)
+      .replace("T", " ");
+
+    const data = {
+  order_id: String(orderId),
+  desc: `Оплата заказа Runo ${orderId}`,
+  amount: normalizedAmount,
+  currency: "KGS",
+  test: Number(process.env.DENGI_TEST ?? 1),
+  long_term: 0,
+  user_to: null,
+  date_life: 60,
+  date_start_push: null,
+  count_push: null,
+  send_push: 1,
+  send_sms: 1,
+  success_url: null,
+  fail_url: null,
+  fields_other: null,
+  transtype: null,
+  result_url: null,
+};
+
+
+    const result = await dengiRequest("createInvoice", data);
+    const invoice = result?.data;
+
+    if (!invoice?.invoice_id || !invoice?.qr) {
+      throw new Error("Dengi.kg не вернул invoice_id или QR-ссылку");
+    }
+
+    const payment = {
+      orderId: String(orderId),
+      invoiceId: String(invoice.invoice_id),
+      qrCode: invoice.qr,
+      amount: normalizedAmount,
+      status: "processing",
+      createdAt: new Date().toISOString(),
+      expiresAt: dateLifeKyrgyzstan,
+      saleCreated: false,
+    };
+
+    payments[String(orderId)] = payment;
+    writeObankPayments(payments);
+
+    return res.json({
+      success: true,
+      orderId,
+      invoiceId: payment.invoiceId,
+      qrCode: payment.qrCode,
+      amount: normalizedAmount / 100,
+      status: payment.status,
+      expiresAt: payment.expiresAt,
+    });
+  } catch (error) {
+    console.error("Ошибка создания О! Банк QR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Не удалось создать QR",
+    });
+  }
+});
+
+// ---------------------------------------------------------
+// ПРОВЕРКА СТАТУСА QR
+// ---------------------------------------------------------
+
+app.post("/api/obank/check-status", async (req, res) => {
+  try {
+    const { orderId } = req.body;
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        message: "Не указан orderId",
+      });
+    }
+
+    const payments = readObankPayments();
+    const payment = payments[String(orderId)];
+
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: "Платёж не найден",
+      });
+    }
+
+    // Не обращаемся к Dengi повторно после конечного статуса.
+    if (payment.status === "approved" || payment.status === "canceled") {
+      return res.json({
+        success: true,
+        status: payment.status,
+        orderId: payment.orderId,
+        amount: payment.amount / 100,
+      });
+    }
+
+    const result = await dengiRequest("statusPayment", {
+      invoice_id: payment.invoiceId,
+      order_id: payment.orderId,
+      mark: null,
+    });
+
+    const responseData = result?.data || {};
+    let status = responseData.status || "processing";
+
+    const transactions = Array.isArray(responseData.payments)
+      ? responseData.payments
+      : [];
+
+    const approvedTransaction = transactions.find(
+      (item) => item.status === "approved",
+    );
+
+    if (approvedTransaction) {
+      const paidAmount = Number(approvedTransaction.amount);
+
+      if (
+        Number.isFinite(paidAmount) &&
+        paidAmount !== payment.amount
+      ) {
+        return res.status(409).json({
+          success: false,
+          status: "amount_mismatch",
+          message: "Сумма платежа не совпадает с суммой заказа",
+        });
+      }
+
+      status = "approved";
+      payment.transactionId = approvedTransaction.trans_id || null;
+    }
+
+    if (!["approved", "processing", "canceled"].includes(status)) {
+      status = "processing";
+    }
+
+    payment.status = status;
+    payment.checkedAt = new Date().toISOString();
+
+    payments[String(orderId)] = payment;
+    writeObankPayments(payments);
+
+    return res.json({
+      success: true,
+      status,
+      orderId: payment.orderId,
+      invoiceId: payment.invoiceId,
+      amount: payment.amount / 100,
+      transactionId: payment.transactionId || null,
+    });
+  } catch (error) {
+    console.error("Ошибка проверки О! Банк QR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Не удалось проверить оплату",
     });
   }
 });

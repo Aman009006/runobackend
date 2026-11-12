@@ -266,6 +266,14 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     "onlineQr",
     "onlineQR",
   ]);
+
+  // О! Банк QR
+  const obankQrKopecks = getPaymentAmount(payment, [
+    "obank_qr",
+    "obankQr",
+    "o_bank_qr",
+  ]);
+
   const cashboxSom =
     payment.cashboxSom !== undefined &&
     payment.cashboxSom !== null &&
@@ -280,6 +288,7 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     mplusKopecks > 0 ||
     localKopecks > 0 ||
     onlineQrKopecks > 0 ||
+    obankQrKopecks > 0 ||
     cashboxSom > 0;
 
   if (hasPaymentFields) {
@@ -289,6 +298,8 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     const mplus = mplusKopecks / 100;
     const local = localKopecks / 100;
     const onlineQr = onlineQrKopecks / 100;
+    const obankQr = obankQrKopecks / 100;
+
     salesByPayment.cashbox += cashboxSom;
 
     salesByPayment.cash += cash;
@@ -297,8 +308,18 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     salesByPayment.mplus += mplus;
     salesByPayment.local += local;
     salesByPayment.online_qr += onlineQr;
+    salesByPayment.obank_qr += obankQr;
 
-    return cash + card + amanat + mplus + local + onlineQr + cashboxSom;
+    return (
+      cash +
+      card +
+      amanat +
+      mplus +
+      local +
+      onlineQr +
+      obankQr +
+      cashboxSom
+    );
   }
 
   const method =
@@ -361,10 +382,21 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
       salesByPayment.online_qr += amount;
       break;
 
+    // О! Банк QR — отдельный способ оплаты
+    case "obank_qr":
+    case "obankqr":
+    case "o_bank_qr":
+    case "obank":
+    case "о! банк qr":
+    case "о банк qr":
+      salesByPayment.obank_qr += amount;
+      break;
+
     case "cash":
     case "наличные":
-  salesByPayment.cash += amount;
-  break;
+      salesByPayment.cash += amount;
+      break;
+
     case "cashbox":
     case "budget":
     case "budgetpayment":
@@ -373,6 +405,7 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
     case "касса бюджет":
       salesByPayment.cashbox += amount;
       break;
+
     case "":
     default:
       salesByPayment.cash += amount;
@@ -388,12 +421,6 @@ function addPaymentToSummary(salesByPayment, item, fallbackAmount = 0) {
 |--------------------------------------------------------------------------
 */
 
-/**
- * Получаем ID брони из кассовой транзакции.
- *
- * Поддерживаются разные варианты,
- * которые могли использоваться в старых версиях.
- */
 function getReservationIdFromTransaction(transaction) {
   if (!transaction || typeof transaction !== "object") {
     return null;
@@ -431,17 +458,11 @@ router.get("/", async (req, res) => {
     */
 
     const cashData = await readJson("cash.json", {});
-
     const expensesData = await readJson("expenses.json", {});
-
     const salesData = await readJson("sales.json", {});
-
     const reservationsData = await readJson("reservations.json", {});
-
     const purchasesData = await readJson("purchases.json", {});
-
     const transfersData = await readJson("transfers.json", {});
-
     const returnsData = await readJson("returns.json", {});
 
     /*
@@ -538,19 +559,12 @@ router.get("/", async (req, res) => {
     */
 
     let cashSales = 0;
-
     let cashReservations = 0;
-
     let cancelledReservationDeposits = 0;
-
     let cashExpenses = 0;
-
     let cashReturns = 0;
-
     let supplierPayments = 0;
-
     let deposits = 0;
-
     let withdraws = 0;
 
     const operationTypes = {};
@@ -561,10 +575,10 @@ router.get("/", async (req, res) => {
       const amount = toNumber(transaction.amount);
 
       /*
-        |--------------------------------------------------------------------------
-        | ОТМЕНЁННАЯ ПРОДАЖА
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | ОТМЕНЁННАЯ ПРОДАЖА
+      |--------------------------------------------------------------------------
+      */
 
       if (
         type === "sale" &&
@@ -575,18 +589,13 @@ router.get("/", async (req, res) => {
       }
 
       /*
-        |--------------------------------------------------------------------------
-        | БРОНИРОВАНИЕ
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | БРОНИРОВАНИЕ
+      |--------------------------------------------------------------------------
+      */
 
       if (type === "reservation") {
         const reservationId = getReservationIdFromTransaction(transaction);
-
-        /*
-          | Если кассовая транзакция напрямую связана
-          | с отменённой бронью — НЕ считаем её приходом.
-          */
 
         if (
           reservationId &&
@@ -607,10 +616,10 @@ router.get("/", async (req, res) => {
       }
 
       /*
-        |--------------------------------------------------------------------------
-        | ОСТАЛЬНЫЕ ОПЕРАЦИИ
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | ОСТАЛЬНЫЕ ОПЕРАЦИИ
+      |--------------------------------------------------------------------------
+      */
 
       operationTypes[type] = (operationTypes[type] || 0) + Math.abs(amount);
 
@@ -682,10 +691,6 @@ router.get("/", async (req, res) => {
     */
 
     const filteredSales = salesArray.filter((sale) => {
-      /*
-        | Отменённые продажи полностью исключаем.
-        */
-
       if (sale.cancelled === true) {
         return false;
       }
@@ -723,6 +728,7 @@ router.get("/", async (req, res) => {
       mplus: 0,
       local: 0,
       online_qr: 0,
+      obank_qr: 0,
       cashbox: 0,
     };
 
@@ -777,29 +783,29 @@ router.get("/", async (req, res) => {
       salesByPayment.mplus +
       salesByPayment.local +
       salesByPayment.online_qr +
-  salesByPayment.cashbox;
+      salesByPayment.obank_qr +
+      salesByPayment.cashbox;
 
-  
-if (
-  filteredSales.length > 0 &&
-  paymentTotalFromSales === 0 &&
-  cashSaleTransactions.length > 0
-) {
-  salesByPayment.cash = 0;
-  salesByPayment.card = 0;
-  salesByPayment.amanat = 0;
-  salesByPayment.mplus = 0;
-  salesByPayment.local = 0;
-  salesByPayment.online_qr = 0;
-  salesByPayment.cashbox = 0;
+    if (
+      filteredSales.length > 0 &&
+      paymentTotalFromSales === 0 &&
+      cashSaleTransactions.length > 0
+    ) {
+      salesByPayment.cash = 0;
+      salesByPayment.card = 0;
+      salesByPayment.amanat = 0;
+      salesByPayment.mplus = 0;
+      salesByPayment.local = 0;
+      salesByPayment.online_qr = 0;
+      salesByPayment.obank_qr = 0;
+      salesByPayment.cashbox = 0;
 
-  cashSaleTransactions.forEach((transaction) => {
-    const amount = Math.abs(toNumber(transaction.amount));
+      cashSaleTransactions.forEach((transaction) => {
+        const amount = Math.abs(toNumber(transaction.amount));
 
-    addPaymentToSummary(salesByPayment, transaction, amount);
-  });
-}
-
+        addPaymentToSummary(salesByPayment, transaction, amount);
+      });
+    }
 
     /*
     |--------------------------------------------------------------------------
@@ -878,10 +884,6 @@ if (
     const dailyMap = {};
 
     filteredCashTransactions.forEach((transaction) => {
-      /*
-        | Отменённая продажа
-        */
-
       if (
         transaction.type === "sale" &&
         transaction.orderId &&
@@ -907,10 +909,10 @@ if (
       const amount = Math.abs(toNumber(transaction.amount));
 
       /*
-        |--------------------------------------------------------------------------
-        | Отменённая бронь
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | Отменённая бронь
+      |--------------------------------------------------------------------------
+      */
 
       if (transaction.type === "reservation") {
         const reservationId = getReservationIdFromTransaction(transaction);
@@ -919,14 +921,6 @@ if (
           reservationId &&
           cancelledReservationIds.has(String(reservationId))
         ) {
-          /*
-            | Не показываем отменённую бронь
-            | в приходе за день.
-            |
-            | Но для net добавляем её обратно,
-            | потому что ниже refund будет вычтен.
-            */
-
           dailyMap[day].net += amount;
 
           return;
@@ -936,10 +930,10 @@ if (
       }
 
       /*
-        |--------------------------------------------------------------------------
-        | Остальные операции
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | Остальные операции
+      |--------------------------------------------------------------------------
+      */
 
       switch (transaction.type) {
         case "sale":
@@ -972,10 +966,10 @@ if (
       }
 
       /*
-        |--------------------------------------------------------------------------
-        | NET
-        |--------------------------------------------------------------------------
-        */
+      |--------------------------------------------------------------------------
+      | NET
+      |--------------------------------------------------------------------------
+      */
 
       dailyMap[day].net =
         dailyMap[day].sales +
@@ -985,12 +979,6 @@ if (
         dailyMap[day].returns -
         dailyMap[day].supplierPayments -
         dailyMap[day].withdraws;
-
-      /*
-        | Важно:
-        | если была отменённая бронь,
-        | её депозит добавляется отдельно в net.
-        */
 
       if (transaction.type === "reservation") {
         const reservationId = getReservationIdFromTransaction(transaction);
@@ -1017,29 +1005,9 @@ if (
     |--------------------------------------------------------------------------
     */
 
-    /*
-    | Приход:
-    |
-    | Продажи
-    | +
-    | только действующие брони
-    |
-    | Отменённые брони сюда НЕ входят.
-    */
-
     const income = cashSales + cashReservations;
 
     const outgoing = cashExpenses + cashReturns + supplierPayments;
-
-    /*
-    | Для netCashFlow учитываем реальные деньги.
-    |
-    | Если было:
-    | отменённая бронь +500
-    | возврат -500
-    |
-    | итог = 0.
-    */
 
     const netCashFlow = income + cancelledReservationDeposits - outgoing;
 
@@ -1143,11 +1111,6 @@ if (
       balance: toNumber(cash.balance),
 
       summary: {
-        /*
-        | Только продажи + действующие брони.
-        | Отменённые брони здесь НЕ учитываются.
-        */
-
         income,
 
         expenses: totalExpenses,
@@ -1165,10 +1128,6 @@ if (
         sales: salesTotal,
 
         salesCount,
-
-        /*
-        | Только действующие брони.
-        */
 
         reservations: reservationsTotal,
 
@@ -1356,10 +1315,10 @@ router.delete("/clear", async (req, res) => {
     ];
 
     /*
-      |--------------------------------------------------------------------------
-      | CASH
-      |--------------------------------------------------------------------------
-      */
+    |--------------------------------------------------------------------------
+    | CASH
+    |--------------------------------------------------------------------------
+    */
 
     const cashData = await readJson("cash.json", {});
 
@@ -1393,10 +1352,10 @@ router.delete("/clear", async (req, res) => {
     await writeJson("cash.json", newCashData);
 
     /*
-      |--------------------------------------------------------------------------
-      | ОСТАЛЬНЫЕ JSON
-      |--------------------------------------------------------------------------
-      */
+    |--------------------------------------------------------------------------
+    | ОСТАЛЬНЫЕ JSON
+    |--------------------------------------------------------------------------
+    */
 
     for (const fileName of files.filter(
       (fileName) => fileName !== "cash.json",
