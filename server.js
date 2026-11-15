@@ -1513,13 +1513,6 @@ async function calculateBundleStock(bundle, stockRows) {
 
       const availableBundles = Math.floor(stock / componentQuantity);
 
-      console.log(`[Комплект] ${bundle.name}`, {
-        component: component.assortment?.name || componentId,
-        componentQuantity,
-        componentStock: stock,
-        availableBundles,
-      });
-
       possibleBundles = Math.min(possibleBundles, availableBundles);
 
       validComponents++;

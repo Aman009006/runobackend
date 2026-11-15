@@ -47,9 +47,7 @@ function getBranchKey() {
   const branchKey = String(branch.id).trim().toLowerCase();
 
   if (!BRANCHES.includes(branchKey)) {
-    throw new Error(
-      `Неизвестный филиал: ${branchKey}. Ожидался: bishkek, dordoy или osh`,
-    );
+    return "bishkek";
   }
 
   return branchKey;
@@ -100,6 +98,8 @@ async function readReservations() {
   await ensureStorage();
 
   const branchKey = getBranchKey();
+
+  console.log("Reading reservations for branch:", branchKey);
 
   const content = await fs.readFile(RESERVATIONS_FILE, "utf8");
 

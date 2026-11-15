@@ -472,6 +472,86 @@ function buildAssortmentMeta(item) {
   };
 }
 
+async function expandBundleForLoss(item) {
+  const assortmentMeta = buildAssortmentMeta(item);
+
+  // Обычный товар или модификация
+  if (assortmentMeta.type !== "bundle") {
+    return [
+      {
+        quantity: item.quantity,
+        assortment: {
+          meta: assortmentMeta,
+        },
+      },
+    ];
+  }
+
+  const bundleId = assortmentMeta.href
+    .split("/")
+    .filter(Boolean)
+    .pop();
+
+  if (!bundleId) {
+    throw new Error(
+      `Не удалось определить ID комплекта "${item.name}"`
+    );
+  }
+
+  // Получаем компоненты комплекта
+  const componentsData = await moySkladRequest(
+    `/entity/bundle/${bundleId}/components?limit=100`
+  );
+
+  const components = componentsData?.rows || [];
+
+  if (components.length === 0) {
+    throw new Error(
+      `Комплект "${item.name}" не содержит компонентов`
+    );
+  }
+
+  const result = [];
+
+  for (const component of components) {
+    const componentQuantity = Number(component.quantity || 0);
+
+    if (!Number.isFinite(componentQuantity) || componentQuantity <= 0) {
+      continue;
+    }
+
+    const componentMeta = component.assortment?.meta;
+
+    if (!componentMeta) {
+      throw new Error(
+        `У компонента комплекта "${item.name}" отсутствует assortment.meta`
+      );
+    }
+
+    if (componentMeta.type === "bundle") {
+      throw new Error(
+        `Вложенный комплект "${item.name}" требует отдельной обработки`
+      );
+    }
+
+    result.push({
+      quantity: componentQuantity * item.quantity,
+
+      assortment: {
+        meta: componentMeta,
+      },
+    });
+  }
+
+  if (result.length === 0) {
+    throw new Error(
+      `Не удалось раскрыть комплект "${item.name}"`
+    );
+  }
+
+  return result;
+}
+
 /*
 |--------------------------------------------------------------------------
 | POST /writeoffs
@@ -620,26 +700,27 @@ router.post("/writeoffs", async (req, res) => {
      * Позиции списания.
      */
 
-    const positions = normalizedItems.map((item) => {
-      const position = {
-        quantity: item.quantity,
+  const positions = [];
 
-        assortment: {
-          meta: buildAssortmentMeta(item),
-        },
-      };
+for (const item of normalizedItems) {
+  const expandedPositions = await expandBundleForLoss(item);
 
-      /*
-       * Причину добавляем,
-       * только если она заполнена.
-       */
+  for (const expandedPosition of expandedPositions) {
+    const position = {
+      ...expandedPosition,
+    };
 
-      if (reason && String(reason).trim()) {
-        position.reason = String(reason).trim();
-      }
+    if (reason && String(reason).trim()) {
+      position.reason = String(reason).trim();
+    }
 
-      return position;
-    });
+    positions.push(position);
+  }
+}
+
+if (positions.length === 0) {
+  throw new Error("После раскрытия комплектов не осталось позиций");
+}
 
     /*
      * Данные для MoySklad.

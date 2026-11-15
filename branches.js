@@ -21,6 +21,17 @@ const BRANCHES = {
     retailStoreId: process.env.MOYSKLAD_RETAIL_STORE_ID_DORDOY,
   },
 
+    bishkekteam: {
+    id: "bishkekteam",
+    name: "Бишкек (команда)",
+
+    login: process.env.BRANCH_BISHKEK_TEAM_LOGIN,
+    password: process.env.BRANCH_BISHKEK_TEAM_PASSWORD,
+
+    storeId: process.env.MOYSKLAD_STORE_ID_DORDOY,
+    retailStoreId: process.env.MOYSKLAD_RETAIL_STORE_ID_DORDOY,
+  },
+
   osh: {
     id: "osh",
     name: "Ош",

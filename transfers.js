@@ -948,29 +948,32 @@ router.post("/outgoing", async (req, res) => {
 
     const organization = organizations.rows[0];
 
-    const positions = items.map((item) => {
-      if (!item.assortmentId) {
-        throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
-      }
+    const positions = [];
 
-      const quantity = Number(item.quantity);
+for (const item of items) {
+  if (!item.assortmentId) {
+    throw new Error(`У товара "${item.name}" отсутствует assortmentId`);
+  }
 
-      if (!Number.isFinite(quantity) || quantity <= 0) {
-        throw new Error(`Некорректное количество товара "${item.name}"`);
-      }
+  const quantity = Number(item.quantity);
 
-      if (!item.assortmentMeta) {
-        throw new Error(`У товара "${item.name}" отсутствует assortmentMeta`);
-      }
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error(`Некорректное количество товара "${item.name}"`);
+  }
 
-      return {
-        quantity,
+  if (!item.assortmentMeta) {
+    throw new Error(`У товара "${item.name}" отсутствует assortmentMeta`);
+  }
 
-        assortment: {
-          meta: item.assortmentMeta,
-        },
-      };
-    });
+  // Раскрываем комплекты на обычные товары
+  const expandedPositions = await expandBundle(item);
+
+  positions.push(...expandedPositions);
+}
+
+if (positions.length === 0) {
+  throw new Error("После обработки товаров не осталось позиций");
+}
 
     const moveData = {
       name: `TR-${Date.now()}`,

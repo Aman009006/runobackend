@@ -204,12 +204,28 @@ function buildTransactions(data) {
 async function getCurrentData() {
   const database = normalizeDatabase(await readDatabase());
 
+  // Миграция старой истории, если она ещё не сохранялась.
+  if (
+    database.transactions.length === 0 &&
+    (database.topups.length > 0 ||
+      database.people.some((person) => person.status === "received"))
+  ) {
+    database.transactions = buildTransactions(database);
+  }
+
   return { database };
+}
+
+function appendTransaction(database, transaction) {
+  database.transactions.unshift({
+    id: crypto.randomUUID(),
+    ...transaction,
+    createdAt: new Date().toISOString(),
+  });
 }
 
 async function persistDatabase(database) {
   database.totals = calculateTotals(database);
-  database.transactions = buildTransactions(database);
 
   await writeDatabase(database);
 }
@@ -280,6 +296,13 @@ router.post("/topups", async (req, res) => {
 
     database.topups.unshift(topup);
 
+    appendTransaction(database, {
+  type: "topup",
+  label: "Пополнение бюджета",
+  amount,
+  comment: topup.comment,
+});
+
     await persistDatabase(database);
 
     return res.status(201).json({
@@ -348,6 +371,16 @@ router.post("/entries", async (req, res) => {
 
     database.people.unshift(person);
 
+    appendTransaction(database, {
+  type: "added",
+  label: "Добавление ожидающего",
+  personId: person.id,
+  name: person.name,
+  phone: person.phone,
+  amount: person.amount,
+  comment: person.comment,
+});
+
     await persistDatabase(database);
 
     return res.status(201).json({
@@ -406,6 +439,16 @@ router.patch("/entries/:id/received", async (req, res) => {
     person.status = "received";
     person.receivedAt = new Date().toISOString();
 
+    appendTransaction(database, {
+  type: "issued",
+  label: "Выдача человеку",
+  personId: person.id,
+  name: person.name,
+  phone: person.phone,
+  amount: person.amount,
+  comment: person.comment,
+});
+
     await persistDatabase(database);
 
     return res.json({
@@ -423,6 +466,133 @@ router.patch("/entries/:id/received", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Не удалось подтвердить получение",
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| DELETE /api/budget/entries/:id
+| Удаление ожидающего человека
+|--------------------------------------------------------------------------
+*/
+
+router.delete("/entries/:id", async (req, res) => {
+  try {
+    const { database } = await getCurrentData();
+
+    const index = database.people.findIndex(
+      (item) => String(item.id) === String(req.params.id),
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        success: false,
+        message: "Запись не найдена",
+      });
+    }
+
+    const person = database.people[index];
+
+    if (person.status !== "waiting") {
+      return res.status(400).json({
+        success: false,
+        message: "Можно удалять только ожидающие записи",
+      });
+    }
+
+    // Удаляем человека из списка.
+    database.people.splice(index, 1);
+
+    // Сохраняем событие в истории.
+    appendTransaction(database, {
+      type: "deleted",
+      label: "Удаление ожидающего",
+      personId: person.id,
+      name: person.name,
+      phone: person.phone,
+      amount: person.amount,
+      comment: person.comment,
+    });
+
+    await persistDatabase(database);
+
+    return res.json({
+      success: true,
+      message: "Запись удалена",
+      totals: database.totals,
+      transactions: database.transactions,
+    });
+  } catch (error) {
+    console.error("DELETE /api/budget/entries:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось удалить запись",
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| PATCH /api/budget/entries/:id/waiting
+| Возврат получившего человека в ожидание
+|--------------------------------------------------------------------------
+*/
+
+router.patch("/entries/:id/waiting", async (req, res) => {
+  try {
+    const { database } = await getCurrentData();
+
+    const person = database.people.find(
+      (item) => String(item.id) === String(req.params.id),
+    );
+
+    if (!person) {
+      return res.status(404).json({
+        success: false,
+        message: "Запись не найдена",
+      });
+    }
+
+    if (person.status !== "received") {
+      return res.status(409).json({
+        success: false,
+        message: "Человек ещё не получал деньги",
+      });
+    }
+
+    // Возвращаем человека в ожидание.
+    person.status = "waiting";
+    person.receivedAt = null;
+
+    // Фиксируем возврат средств в истории.
+    appendTransaction(database, {
+      type: "returned",
+      label: "Возврат в ожидание",
+      personId: person.id,
+      name: person.name,
+      phone: person.phone,
+      amount: person.amount,
+      comment: person.comment,
+    });
+
+    // Пересчитываем бюджет.
+    await persistDatabase(database);
+
+    return res.json({
+      success: true,
+      message: "Человек возвращён в список ожидающих",
+      person,
+      totals: database.totals,
+      transactions: database.transactions,
+    });
+  } catch (error) {
+    console.error("PATCH /api/budget/entries/:id/waiting:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось вернуть человека в ожидание",
     });
   }
 });
