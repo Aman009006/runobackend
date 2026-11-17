@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { getCurrentBranch } = require("./branchContext");
+const { attachOnlineCashSocket } = require("./onlineCashSocket"); // вверху файла
 
 require("dotenv").config();
 
@@ -2890,11 +2891,11 @@ app.patch("/api/moysklad/sales/:saleId/salesperson", (req, res) => {
    START
 ========================================================= */
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Backend запущен: http://localhost:${PORT}`);
-
-  // console.log(`Retail Store ID: ${RETAIL_STORE_ID || "НЕ УКАЗАН"}`);
 });
+
+attachOnlineCashSocket(server);
 
 // возврат
 app.post("/api/moysklad/returns", async (req, res) => {
