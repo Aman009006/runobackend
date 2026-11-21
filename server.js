@@ -1438,99 +1438,56 @@ app.get("/api/moysklad/retail-stores", async (req, res) => {
   }
 });
 
-async function calculateBundleStock(bundle, stockRows) {
+async function calculateBundleStock(bundle, stockById) {
   try {
     const bundleId = bundle.id || bundle.meta?.href?.split("/").pop();
 
     if (!bundleId) {
-      console.warn(`[Комплект] Не удалось определить ID: "${bundle.name}"`);
       return 0;
     }
 
     const components = await getBundleComponents(bundleId);
 
     if (!Array.isArray(components) || components.length === 0) {
-      console.warn(`[Комплект] "${bundle.name}": состав не найден`);
       return 0;
     }
 
     let possibleBundles = Infinity;
-    let validComponents = 0;
 
     for (const component of components) {
       const componentQuantity = Number(component.quantity);
 
       if (!Number.isFinite(componentQuantity) || componentQuantity <= 0) {
-        console.warn(
-          `[Комплект] "${bundle.name}": некорректное количество компонента`,
-          component,
-        );
         return 0;
       }
 
-      const componentMeta = component.assortment?.meta;
-      const componentHref = componentMeta?.href;
+      const href = component.assortment?.meta?.href;
 
-      if (!componentHref) {
-        console.warn(
-          `[Комплект] "${bundle.name}": отсутствует ссылка на компонент`,
-          component,
-        );
+      if (!href) {
         return 0;
       }
 
-      const cleanHref = componentHref.split("?")[0].replace(/\/+$/, "");
-      const componentId = cleanHref.split("/").pop();
-      const componentType = componentMeta.type;
+      const componentId = href
+        .split("?")[0]
+        .replace(/\/+$/, "")
+        .split("/")
+        .pop();
 
-      const stockItem = stockRows.find((item) => {
-        const itemHref = item.meta?.href?.split("?")[0].replace(/\/+$/, "");
+      const stock = Number(stockById.get(componentId)?.stock ?? 0);
 
-        if (!itemHref) {
-          return false;
-        }
-
-        const itemId = itemHref.split("/").pop();
-
-        return (
-          itemId === componentId &&
-          (!componentType || item.meta?.type === componentType)
-        );
-      });
-
-      const stock = Number(stockItem?.stock ?? 0);
-
-      if (!stockItem) {
-        console.warn(
-          `[Комплект] "${bundle.name}": компонент не найден в отчёте остатков`,
-          {
-            componentId,
-            componentType,
-            componentHref,
-            componentName: component.assortment?.name,
-          },
-        );
-      }
-
-      const availableBundles = Math.floor(stock / componentQuantity);
-
-      possibleBundles = Math.min(possibleBundles, availableBundles);
-
-      validComponents++;
+      possibleBundles = Math.min(
+        possibleBundles,
+        Math.floor(stock / componentQuantity),
+      );
 
       if (possibleBundles <= 0) {
         return 0;
       }
     }
 
-    if (validComponents === 0 || !Number.isFinite(possibleBundles)) {
-      return 0;
-    }
-
-    return possibleBundles;
+    return Number.isFinite(possibleBundles) ? possibleBundles : 0;
   } catch (error) {
     console.error(`[Комплект] Ошибка расчёта "${bundle.name}":`, error);
-
     return 0;
   }
 }
@@ -1605,286 +1562,174 @@ async function refreshProductsCache(storeId) {
 
   const loadingPromise = (async () => {
     try {
-      const storeHref = `${MOYSKLAD_API}/entity/store/${storeId}`;
-
-      const filterParam = encodeURIComponent(`store=${storeHref}`);
-
-      const stockRows = await getAllMoySkladRows(
-        `/report/stock/all?filter=${filterParam}`,
+      // Остатки по всем складам, оставляем только склад филиала
+      const stockResponse = await moySkladRequest(
+        `/report/stock/bystore/current`,
       );
 
+      const stockRows = Array.isArray(stockResponse) ? stockResponse : [];
+
+      // assortmentId -> остаток на складе филиала
+      const stockById = new Map();
+
+      for (const row of stockRows) {
+        if (row.storeId !== storeId) continue;
+        stockById.set(row.assortmentId, row);
+      }
+
       const productRows = await getAllMoySkladRows(`/entity/product`);
-
       const variantRows = await getAllMoySkladRows(`/entity/variant`);
-
       const bundles = await getAllMoySkladRows(`/entity/bundle`);
-
-      const stockMap = new Map();
-
-      for (const item of stockRows) {
-        const rawHref = item.meta?.href || "";
-
-        const cleanHref = rawHref.split("?")[0];
-
-        const id = cleanHref.split("/").pop() || "";
-
-        if (!id) {
-          continue;
-        }
-
-        const type = item.meta?.type || "product";
-
-        stockMap.set(`${type}:${id}`, item);
-      }
-
-      /*
-       * =================================================
-       * 6. ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ
-       * =================================================
-       */
-
-      function getSalePrice(item, stockItem) {
-        /*
-         * Для stock report
-         */
-
-        if (stockItem?.salePrice != null) {
-          return Number(stockItem.salePrice) / 100;
-        }
-
-        /*
-         * Для product / variant
-         */
-
-        if (item.salePrices?.[0]?.value != null) {
-          return Number(item.salePrices[0].value) / 100;
-        }
-
-        if (item.salePrice?.value != null) {
-          return Number(item.salePrice.value) / 100;
-        }
-
-        return 0;
-      }
-
-      /*
-       * =================================================
-       * 7. ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ ЗАКУПКИ
-       * =================================================
-       */
-
-      function getBuyPrice(item, stockItem) {
-        /*
-         * В stock report цена закупки
-         */
-
-        if (stockItem?.price != null) {
-          return Number(stockItem.price) / 100;
-        }
-
-        /*
-         * В product / variant buyPrice
-         * может быть числом
-         */
-
-        if (typeof item.buyPrice === "number") {
-          return Number(item.buyPrice) / 100;
-        }
-
-        /*
-         * Или объектом { value: ... }
-         */
-
-        if (item.buyPrice?.value != null) {
-          return Number(item.buyPrice.value) / 100;
-        }
-
-        return 0;
-      }
-
-      /*
-       * =================================================
-       * 8. ФУНКЦИЯ ПОЛУЧЕНИЯ ID
-       * =================================================
-       */
 
       function getEntityId(item) {
         const rawHref = item.meta?.href || "";
-
         const cleanHref = rawHref.split("?")[0];
-
         return cleanHref.split("/").pop() || item.id || "";
       }
 
-      /*
-       * =================================================
-       * 9. ПРЕОБРАЗОВАНИЕ PRODUCT / VARIANT
-       * =================================================
-       */
+      function getSalePrice(item) {
+        if (item.salePrices?.[0]?.value != null) {
+          return Number(item.salePrices[0].value) / 100;
+        }
+        if (item.salePrice?.value != null) {
+          return Number(item.salePrice.value) / 100;
+        }
+        return 0;
+      }
 
-      function normalizeCatalogItem(item, type) {
+      function getBuyPrice(item) {
+        if (typeof item.buyPrice === "number") {
+          return Number(item.buyPrice) / 100;
+        }
+        if (item.buyPrice?.value != null) {
+          return Number(item.buyPrice.value) / 100;
+        }
+        return 0;
+      }
+
+      // Родители, у которых есть модификации: продаём модификации
+      const parentIdsWithVariants = new Set();
+      const variantParentById = new Map();
+
+      for (const variant of variantRows) {
+        const parentHref = variant.product?.meta?.href || "";
+        const parentId = parentHref.split("?")[0].split("/").pop();
+
+        if (parentId) {
+          parentIdsWithVariants.add(parentId);
+          variantParentById.set(getEntityId(variant), parentId);
+        }
+      }
+
+      const productPathById = new Map(
+        productRows.map((item) => [
+          getEntityId(item),
+          item.productFolder?.name || item.folder?.name || "",
+        ]),
+      );
+
+      const productNameById = new Map(
+        productRows.map((item) => [getEntityId(item), item.name || ""]),
+      );
+
+      function normalizeCatalogItem(item, type, parentPathName) {
         const id = getEntityId(item);
+        const stockItem = stockById.get(id);
 
-        const stockItem = stockMap.get(`${type}:${id}`);
-
-        const price = getSalePrice(item, stockItem);
-
-        const buyPrice = getBuyPrice(item, stockItem);
-
-        /*
-         * Если позиции нет в stock report,
-         * она всё равно должна существовать.
-         *
-         * Просто остаток будет 0.
-         */
-
-        const stock = stockItem ? Number(stockItem.stock || 0) : 0;
-
-        const reserve = stockItem ? Number(stockItem.reserve || 0) : 0;
-
-        const inTransit = stockItem ? Number(stockItem.inTransit || 0) : 0;
-
-        const reserveStock = stockItem
-          ? Number(stockItem.reserveStock || 0)
-          : 0;
+        const buyPrice = getBuyPrice(item);
 
         return {
           id,
-
           name:
             item.name ||
             (type === "variant"
               ? "Модификация без названия"
               : "Товар без названия"),
-
           code: item.code || "",
-
           article: item.article || "",
-
-          price,
-
+          price: getSalePrice(item),
           buyPrice,
-
           costPrice: buyPrice,
-
-          stock,
-
-          reserve,
-
-          inTransit,
-
-          reserveStock,
-
+          stock: Number(stockItem?.stock || 0),
+          reserve: Number(stockItem?.reserve || 0),
+          inTransit: Number(stockItem?.inTransit || 0),
+          reserveStock: 0,
           meta: item.meta,
-
-          uom: item.uom?.name || stockItem?.uom?.name || "шт",
-
+          uom: item.uom?.name || "шт",
           pathName:
             item.productFolder?.name ||
             item.folder?.name ||
-            stockItem?.folder?.name ||
-            stockItem?.productFolder?.name ||
+            parentPathName ||
             "Общая категория",
-
           description: item.description || "",
-
           type,
-
           isBundle: false,
-
-          /*
-           * Дополнительно сохраняем,
-           * что это именно модификация.
-           */
-
           isVariant: type === "variant",
+          parentId: variantParentById.get(id) || null,
         };
       }
 
-      /*
-       * =================================================
-       * 10. ОБЫЧНЫЕ ТОВАРЫ
-       * =================================================
-       */
+      // Обычные товары (без модификаций)
+      const products = productRows
+        .filter((item) => !parentIdsWithVariants.has(getEntityId(item)))
+        .map((item) => normalizeCatalogItem(item, "product"));
 
-      const products = productRows.map((item) =>
-        normalizeCatalogItem(item, "product"),
-      );
+      // Модификации
+      const variants = variantRows.map((item) => {
+        const id = getEntityId(item);
+        const parentId = variantParentById.get(id);
 
-      /*
-       * =================================================
-       * 11. МОДИФИКАЦИИ
-       * =================================================
-       */
+        const normalized = normalizeCatalogItem(
+          item,
+          "variant",
+          productPathById.get(parentId) || "",
+        );
 
-      const variants = variantRows.map((item) =>
-        normalizeCatalogItem(item, "variant"),
-      );
+        const parentName = productNameById.get(parentId) || "";
+        const characteristics = Array.isArray(item.characteristics)
+          ? item.characteristics
+              .map((c) => c.value)
+              .filter(Boolean)
+              .join(", ")
+          : "";
 
-      /*
-       * =================================================
-       * 12. КОМПЛЕКТЫ
-       * =================================================
-       */
+        if (parentName && !normalized.name.includes(parentName)) {
+          normalized.name = characteristics
+            ? `${parentName} (${characteristics})`
+            : `${parentName} ${normalized.name}`.trim();
+        }
 
+        return normalized;
+      });
+
+      // Комплекты
       const bundleProducts = [];
 
       for (const bundle of bundles) {
         try {
-          const bundleId = getEntityId(bundle);
-
-          const price =
-            bundle.salePrices?.[0]?.value != null
-              ? Number(bundle.salePrices[0].value) / 100
-              : 0;
-
-          const buyPrice =
-            bundle.buyPrice?.value != null
-              ? Number(bundle.buyPrice.value) / 100
-              : typeof bundle.buyPrice === "number"
-                ? Number(bundle.buyPrice) / 100
-                : 0;
-
-          const stock = await calculateBundleStock(bundle, stockRows);
+          const buyPrice = getBuyPrice(bundle);
 
           bundleProducts.push({
-            id: bundleId,
-
+            id: getEntityId(bundle),
             name: bundle.name || "Комплект без названия",
-
             code: bundle.code || "",
-
             article: bundle.article || "",
-
-            price,
-
+            price: getSalePrice(bundle),
             buyPrice,
-
             costPrice: buyPrice,
-
-            stock,
-
+            stock: await calculateBundleStock(bundle, stockById),
             reserve: 0,
-
             inTransit: 0,
-
             reserveStock: 0,
-
             meta: bundle.meta,
-
             uom: bundle.uom?.name || "шт",
-
             pathName:
               bundle.productFolder?.name ||
               bundle.folder?.name ||
               "Общая категория",
-
             description: bundle.description || "",
-
             type: "bundle",
-
             isBundle: true,
-
             isVariant: false,
           });
         } catch (error) {
@@ -1895,62 +1740,29 @@ async function refreshProductsCache(storeId) {
         }
       }
 
-      /*
-       * =================================================
-       * 13. ОБЪЕДИНЯЕМ ВСЁ
-       * =================================================
-       */
-
       const allProducts = [...products, ...variants, ...bundleProducts];
-
-      /*
-       * =================================================
-       * 14. ПРОВЕРКА
-       * =================================================
-       */
 
       if (allProducts.length === 0) {
         throw new Error("МойСклад вернул пустой список товаров");
       }
 
-      /*
-       * =================================================
-       * 15. РЕЗУЛЬТАТ
-       * =================================================
-       */
-
       const result = {
         storeId,
-
-        // storeName: "Молодая Гвардия 41",
-
         total: allProducts.length,
-
         productsCount: products.length,
-
         variantsCount: variants.length,
-
         bundlesCount: bundleProducts.length,
-
         rows: allProducts,
       };
 
-      /*
-       * =================================================
-       * 16. СОХРАНЯЕМ В КЭШ
-       * =================================================
-       */
-
       productsCache.set(storeId, {
         timestamp: Date.now(),
-
         data: result,
       });
 
       return result;
     } catch (error) {
       console.error("Ошибка обновления products:", error.message);
-
       throw error;
     } finally {
       productsLoading.delete(storeId);
@@ -3764,5 +3576,99 @@ app.post("/api/obank/check-status", async (req, res) => {
       success: false,
       message: error.message || "Не удалось проверить оплату",
     });
+  }
+});
+app.get("/api/moysklad/debug-stock", async (req, res) => {
+  try {
+    const branch = getCurrentBranch();
+    const q = String(req.query.q || "").toLowerCase().trim();
+
+    if (!q) {
+      return res.status(400).json({ message: "Укажите ?q=слово" });
+    }
+
+    const storeHref = `${MOYSKLAD_API}/entity/store/${branch.storeId}`;
+    const filter = encodeURIComponent(`store=${storeHref}`);
+
+    const idOf = (r) =>
+      (r.meta?.href || "").split("?")[0].split("/").pop() || r.id || "";
+
+    const pick = (r) => ({
+      id: idOf(r),
+      name: r.name,
+      type: r.meta?.type,
+      stock: r.stock,
+    });
+
+    const match = (r) => (r.name || "").toLowerCase().includes(q);
+
+    // Остатки по складу филиала
+    const storeRows = await getAllMoySkladRows(
+      `/report/stock/all?filter=${filter}`,
+    );
+
+    // Остатки по всем складам вместе
+    const allRows = await getAllMoySkladRows(`/report/stock/all`);
+
+    // Каталог товаров и модификаций
+    const products = await getAllMoySkladRows(
+      `/entity/product?search=${encodeURIComponent(q)}`,
+    );
+    const variants = await getAllMoySkladRows(
+      `/entity/variant?search=${encodeURIComponent(q)}`,
+    );
+
+    // Список складов
+    const stores = await getAllMoySkladRows(`/entity/store`);
+
+    res.json({
+      branch: { id: branch.id, storeId: branch.storeId },
+      stores: stores.map((s) => ({ id: s.id, name: s.name })),
+      rowsInStoreReport: storeRows.length,
+      rowsInAllStoresReport: allRows.length,
+      inStoreReport: storeRows.filter(match).map(pick),
+      inAllStoresReport: allRows.filter(match).map(pick),
+      inCatalog: [...products, ...variants].map(pick),
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.get("/api/moysklad/debug-stock2", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.status(400).json({ message: "Укажите ?q=слово" });
+
+    const products = await getAllMoySkladRows(
+      `/entity/product?search=${encodeURIComponent(q)}`,
+    );
+    const variants = await getAllMoySkladRows(
+      `/entity/variant?search=${encodeURIComponent(q)}`,
+    );
+    const stores = await getAllMoySkladRows(`/entity/store`);
+
+    const ids = new Set([...products, ...variants].map((x) => x.id));
+    const storeName = new Map(stores.map((s) => [s.id, s.name]));
+
+    const rows = await moySkladRequest(`/report/stock/bystore/current`);
+
+    const found = (Array.isArray(rows) ? rows : [])
+      .filter((r) => ids.has(r.assortmentId))
+      .map((r) => ({
+        assortmentId: r.assortmentId,
+        store: storeName.get(r.storeId) || r.storeId,
+        stock: r.stock,
+        reserve: r.reserve,
+        inTransit: r.inTransit,
+      }));
+
+    res.json({
+      checkedIds: [...ids],
+      totalRows: Array.isArray(rows) ? rows.length : null,
+      found,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
   }
 });
